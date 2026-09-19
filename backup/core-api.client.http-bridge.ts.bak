@@ -1,0 +1,142 @@
+import { Injectable } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { HttpService } from '@nestjs/axios';
+import { firstValueFrom } from 'rxjs';
+
+export interface CategoryDto {
+  id: number;
+  name: string;
+  enabled: boolean;
+}
+
+export interface SourceDto {
+  id: number;
+  name: string;
+  enabled: boolean;
+}
+
+export interface SubscriptionsDto {
+  categoryIds: number[];
+  sourceIds: number[];
+}
+
+export interface UserStateDto {
+  chatId: string;
+  active: boolean;
+}
+
+export interface BootstrapDto {
+  active: boolean;
+  categoryIds: number[];
+  sourceIds: number[];
+  categories: CategoryDto[];
+  sources: SourceDto[];
+}
+
+/**
+ * The only way the telegram-bot module talks to the core module: synchronous
+ * HTTP request/response against Core's public endpoints. No shared services,
+ * repositories, or entities are imported across this boundary. chat_id is
+ * the identity used throughout — this bot only ever does 1:1 DMs, where
+ * Telegram's chat_id and user_id are the same value.
+ */
+@Injectable()
+export class CoreApiClient {
+  private readonly baseUrl: string;
+
+  constructor(
+    private readonly http: HttpService,
+    config: ConfigService,
+  ) {
+    this.baseUrl = config.get<string>('CORE_BASE_URL')!;
+  }
+
+  /** Idempotent row creation only — never reactivates. Call at the start of
+   * every command handler before anything else. Returns the user's current
+   * active status, since /categories and /sources need it to decide
+   * whether to show the inactive notice/resume button. */
+  async ensureUser(chatId: string): Promise<UserStateDto> {
+    const res = await firstValueFrom(
+      this.http.post<UserStateDto>(`${this.baseUrl}/users/${chatId}`, {}),
+    );
+    return res.data;
+  }
+
+  /** Explicit activation — /start (always) and the "Resume" picker button. */
+  async activateUser(chatId: string): Promise<void> {
+    await firstValueFrom(
+      this.http.post(`${this.baseUrl}/users/${chatId}/activate`, {}),
+    );
+  }
+
+  /**
+   * Everything needed to render /start, /categories, or /sources's first
+   * screen, in one call. Pass activate:true only for /start.
+   */
+  async bootstrap(chatId: string, activate: boolean): Promise<BootstrapDto> {
+    const res = await firstValueFrom(
+      this.http.post<BootstrapDto>(
+        `${this.baseUrl}/users/${chatId}/bootstrap`,
+        {
+          activate,
+        },
+      ),
+    );
+    return res.data;
+  }
+
+  async getCategories(): Promise<CategoryDto[]> {
+    const res = await firstValueFrom(
+      this.http.get<CategoryDto[]>(`${this.baseUrl}/categories`),
+    );
+    return res.data;
+  }
+
+  async getSources(): Promise<SourceDto[]> {
+    const res = await firstValueFrom(
+      this.http.get<SourceDto[]>(`${this.baseUrl}/sources`),
+    );
+    return res.data;
+  }
+
+  async getSubscriptions(chatId: string): Promise<SubscriptionsDto> {
+    const res = await firstValueFrom(
+      this.http.get<SubscriptionsDto>(
+        `${this.baseUrl}/users/${chatId}/subscriptions`,
+      ),
+    );
+    return res.data;
+  }
+
+  async updateSubscriptions(
+    chatId: string,
+    categoryIds: number[],
+    sourceIds: number[],
+  ): Promise<SubscriptionsDto> {
+    const res = await firstValueFrom(
+      this.http.post<SubscriptionsDto>(
+        `${this.baseUrl}/users/${chatId}/subscriptions`,
+        { categoryIds, sourceIds },
+      ),
+    );
+    return res.data;
+  }
+
+  async deactivateUser(chatId: string): Promise<void> {
+    await firstValueFrom(
+      this.http.post(`${this.baseUrl}/users/${chatId}/deactivate`, {}),
+    );
+  }
+
+  async setNotificationStatus(
+    jobId: string,
+    chatId: string,
+    status: 'sent' | 'failed',
+  ): Promise<void> {
+    await firstValueFrom(
+      this.http.patch(`${this.baseUrl}/notifications/${jobId}/${chatId}`, {
+        status,
+      }),
+    );
+  }
+}

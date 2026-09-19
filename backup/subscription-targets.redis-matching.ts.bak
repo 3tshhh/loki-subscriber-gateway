@@ -1,0 +1,110 @@
+import type Redis from 'ioredis';
+import { REDIS_KEYS } from './redis.constants';
+
+/**
+ * A subscriber's Redis target for one category: an exact source, or the
+ * "any source under this category" wildcard when they picked none. Shared
+ * between core/subscriber/subscriber.service.ts and
+ * telegram-bot/bot-subscriber.service.ts — two independent Postgres access
+ * paths that both need to keep the exact same Redis key scheme in sync, so
+ * this (pure, DB-free) math lives in one place rather than being duplicated.
+ */
+export interface RedisTarget {
+  categoryId: string;
+  sourceId: string | null;
+}
+
+export function redisKeyForTarget(target: RedisTarget): string {
+  return target.sourceId === null
+    ? REDIS_KEYS.subscriberSetAnySource(target.categoryId)
+    : REDIS_KEYS.subscriberSet(target.categoryId, target.sourceId);
+}
+
+/**
+ * One Redis target per picked category: an exact category+source pair for
+ * each picked source, or — when zero sources are picked — a single "any
+ * source" wildcard target for that category.
+ */
+export function subscriptionRedisTargets(
+  categoryIds: string[],
+  sourceIds: string[],
+): Map<string, RedisTarget> {
+  const targets = new Map<string, RedisTarget>();
+  for (const categoryId of categoryIds) {
+    if (sourceIds.length === 0) {
+      targets.set(`${categoryId}:*`, { categoryId, sourceId: null });
+      continue;
+    }
+
+    for (const sourceId of sourceIds) {
+      targets.set(`${categoryId}:${sourceId}`, { categoryId, sourceId });
+    }
+  }
+  return targets;
+}
+
+async function applyRedisTargetDiff(
+  redis: Redis,
+  chatId: string,
+  toAdd: [string, RedisTarget][],
+  toRemove: [string, RedisTarget][],
+): Promise<void> {
+  if (toAdd.length === 0 && toRemove.length === 0) return;
+  const pipeline = redis.pipeline();
+  for (const [, target] of toAdd) {
+    pipeline.sadd(redisKeyForTarget(target), chatId);
+  }
+  for (const [, target] of toRemove) {
+    pipeline.srem(redisKeyForTarget(target), chatId);
+  }
+  await pipeline.exec();
+}
+
+/**
+ * Reconciles a subscriber's Redis set membership by SADD/SREM-ing only the
+ * delta between their old and new category/source picks — never a blind
+ * rebuild. This is the one place either service needs to call for a real
+ * subscription change.
+ */
+export async function reconcileSubscriberSets(
+  redis: Redis,
+  chatId: string,
+  oldCategoryIds: string[],
+  oldSourceIds: string[],
+  newCategoryIds: string[],
+  newSourceIds: string[],
+): Promise<void> {
+  const oldTargets = subscriptionRedisTargets(oldCategoryIds, oldSourceIds);
+  const newTargets = subscriptionRedisTargets(newCategoryIds, newSourceIds);
+
+  const toAdd = [...newTargets.entries()].filter(
+    ([key]) => !oldTargets.has(key),
+  );
+  const toRemove = [...oldTargets.entries()].filter(
+    ([key]) => !newTargets.has(key),
+  );
+
+  await applyRedisTargetDiff(redis, chatId, toAdd, toRemove);
+}
+
+/** Adds every target for the given picks — e.g. restoring membership on
+ * reactivation, where "old" is empty (nothing to remove). */
+export async function addSubscriberSets(
+  redis: Redis,
+  chatId: string,
+  categoryIds: string[],
+  sourceIds: string[],
+): Promise<void> {
+  return reconcileSubscriberSets(redis, chatId, [], [], categoryIds, sourceIds);
+}
+
+/** Removes every target for the given picks — e.g. on deactivation, where
+ * "new" is empty (nothing to add). */
+export async function removeSubscriberSets(
+  redis: Redis,
+  chatId: string,
+  categoryIds: string[],
+  sourceIds: string[],
+): Promise<void> {
+  return reconcileSubscriberSets(redis, chatId, categoryIds, sourceIds, [], []);
+}

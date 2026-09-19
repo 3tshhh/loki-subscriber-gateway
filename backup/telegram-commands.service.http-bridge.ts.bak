@@ -1,0 +1,293 @@
+import { Inject, Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { Bot, Context } from 'grammy';
+import { BOT } from '../bot.provider';
+import { CoreApiClient } from '../core-api.client';
+import {
+  categoryCaption,
+  categoryKeyboard,
+  RESUME_CATEGORIES_CALLBACK,
+  RESUME_SOURCES_CALLBACK,
+  reviewMessage,
+  sourceCaption,
+  sourceKeyboard,
+} from './selector.util';
+import { toggleId, WizardState, WizardStateStore } from './wizard-state.store';
+
+/**
+ * A deferred-save wizard: toggling categories/sources never hits Core — the
+ * in-progress picks live in WizardStateStore. Only "Done" (categories-only
+ * or sources-only mode) or the sources screen's "Done" (wizard mode, after
+ * chaining through categories first) sends one combined
+ * updateSubscriptions(chatId, categoryIds, sourceIds) call. See
+ * backup/*.immediate-save-wizard.ts.bak for the previous per-toggle-save
+ * version this replaces.
+ */
+@Injectable()
+export class TelegramCommandsService implements OnModuleInit {
+  private readonly logger = new Logger(TelegramCommandsService.name);
+
+  constructor(
+    @Inject(BOT) private readonly bot: Bot,
+    private readonly coreApi: CoreApiClient,
+    private readonly wizard: WizardStateStore,
+  ) {}
+
+  onModuleInit() {
+    this.bot.command('start', (ctx) => this.handleStart(ctx));
+    this.bot.command('stop', (ctx) => this.handleStop(ctx));
+    this.bot.command('categories', (ctx) => this.handleCategoriesCommand(ctx));
+    this.bot.command('sources', (ctx) => this.handleSourcesCommand(ctx));
+    this.bot.on('callback_query:data', (ctx) => this.handleCallback(ctx));
+  }
+
+  private async handleStart(ctx: Context): Promise<void> {
+    if (!ctx.chat) return;
+    const chatId = String(ctx.chat.id);
+    const boot = await this.coreApi.bootstrap(chatId, true);
+    this.wizard.start(chatId, {
+      categoryIds: boot.categoryIds,
+      sourceIds: boot.sourceIds,
+      mode: 'wizard',
+    });
+
+    await ctx.reply(
+      'Welcome to Loki Jobs 👋\n\nChoose the categories you want to receive.',
+      {
+        reply_markup: categoryKeyboard(
+          boot.categories,
+          boot.categoryIds,
+          false,
+        ),
+      },
+    );
+  }
+
+  private async handleStop(ctx: Context): Promise<void> {
+    if (!ctx.chat) return;
+    const chatId = String(ctx.chat.id);
+    try {
+      await this.coreApi.ensureUser(chatId);
+      await this.coreApi.deactivateUser(chatId);
+      this.wizard.clear(chatId);
+      await ctx.reply(
+        "You've been unsubscribed from notifications. You won't receive any more job notifications.\n\n" +
+          'To start receiving jobs again, send /start.',
+      );
+    } catch (err) {
+      this.logger.error(
+        `Failed to deactivate chat ${chatId}: ${(err as Error).message}`,
+        (err as Error).stack,
+      );
+      await ctx.reply('Something went wrong, please try again.');
+    }
+  }
+
+  private async handleCategoriesCommand(ctx: Context): Promise<void> {
+    if (!ctx.chat) return;
+    const chatId = String(ctx.chat.id);
+    const boot = await this.coreApi.bootstrap(chatId, false);
+    this.wizard.start(chatId, {
+      categoryIds: boot.categoryIds,
+      sourceIds: boot.sourceIds,
+      mode: 'categories-only',
+    });
+    await ctx.reply(categoryCaption(!boot.active), {
+      reply_markup: categoryKeyboard(
+        boot.categories,
+        boot.categoryIds,
+        !boot.active,
+      ),
+    });
+  }
+
+  private async handleSourcesCommand(ctx: Context): Promise<void> {
+    if (!ctx.chat) return;
+    const chatId = String(ctx.chat.id);
+    const boot = await this.coreApi.bootstrap(chatId, false);
+    this.wizard.start(chatId, {
+      categoryIds: boot.categoryIds,
+      sourceIds: boot.sourceIds,
+      mode: 'sources-only',
+    });
+    await ctx.reply(sourceCaption(!boot.active), {
+      reply_markup: sourceKeyboard(boot.sources, boot.sourceIds, !boot.active),
+    });
+  }
+
+  private async handleCallback(ctx: Context): Promise<void> {
+    const data = ctx.callbackQuery?.data;
+    if (!data || !ctx.chat) return;
+    const chatId = String(ctx.chat.id);
+
+    try {
+      if (
+        data === RESUME_CATEGORIES_CALLBACK ||
+        data === RESUME_SOURCES_CALLBACK
+      ) {
+        await this.handleResume(ctx, chatId, data);
+        return;
+      }
+
+      const state = this.wizard.get(chatId);
+      if (!state) {
+        await ctx.answerCallbackQuery({
+          text: 'Session expired, please send /start again.',
+          show_alert: true,
+        });
+        return;
+      }
+
+      if (data === 'done') {
+        await this.handleCategoriesDone(ctx, chatId, state);
+        return;
+      }
+
+      if (data === 'src:done') {
+        await ctx.answerCallbackQuery();
+        await this.finalizeWizard(ctx, chatId, state);
+        return;
+      }
+
+      if (data.startsWith('src:')) {
+        await this.handleSourceToggle(ctx, state, data.slice(4));
+        return;
+      }
+
+      if (data.startsWith('cat:')) {
+        await this.handleCategoryToggle(ctx, state, data.slice(4));
+        return;
+      }
+
+      await ctx.answerCallbackQuery();
+    } catch (err) {
+      this.logger.error(
+        `Failed to handle callback ${data}: ${(err as Error).message}`,
+        (err as Error).stack,
+      );
+      await ctx.answerCallbackQuery({
+        text: 'Something went wrong, please try again.',
+      });
+    }
+  }
+
+  /** Resume re-renders using the in-progress wizard picks, not a fresh
+   * Core fetch — nothing has been saved yet, so Core wouldn't reflect them. */
+  private async handleResume(
+    ctx: Context,
+    chatId: string,
+    data: string,
+  ): Promise<void> {
+    await this.coreApi.activateUser(chatId);
+    await ctx.answerCallbackQuery({ text: 'Notifications resumed ✅' });
+    const state = this.wizard.get(chatId);
+
+    if (data === RESUME_SOURCES_CALLBACK) {
+      const sources = await this.coreApi.getSources();
+      await ctx.editMessageText(sourceCaption(false), {
+        reply_markup: sourceKeyboard(sources, state?.sourceIds ?? [], false),
+      });
+    } else {
+      const categories = await this.coreApi.getCategories();
+      await ctx.editMessageText(categoryCaption(false), {
+        reply_markup: categoryKeyboard(
+          categories,
+          state?.categoryIds ?? [],
+          false,
+        ),
+      });
+    }
+  }
+
+  /** Categories "Done": wizard mode chains to the sources screen (no save
+   * yet); categories-only mode finalizes immediately. */
+  private async handleCategoriesDone(
+    ctx: Context,
+    chatId: string,
+    state: WizardState,
+  ): Promise<void> {
+    if (state.mode === 'wizard') {
+      await ctx.answerCallbackQuery();
+      const sources = await this.coreApi.getSources();
+      await ctx.editMessageText(sourceCaption(false), {
+        reply_markup: sourceKeyboard(sources, state.sourceIds, false),
+      });
+      return;
+    }
+
+    await ctx.answerCallbackQuery();
+    await this.finalizeWizard(ctx, chatId, state);
+  }
+
+  private async handleSourceToggle(
+    ctx: Context,
+    state: WizardState,
+    raw: string,
+  ): Promise<void> {
+    const sourceId = Number(raw);
+    const sources = await this.coreApi.getSources();
+    if (!sources.some((s) => s.id === sourceId)) {
+      await ctx.answerCallbackQuery({
+        text: 'That source is no longer available.',
+        show_alert: true,
+      });
+      return;
+    }
+
+    toggleId(state.sourceIds, sourceId);
+    await ctx.answerCallbackQuery();
+    await ctx.editMessageReplyMarkup({
+      reply_markup: sourceKeyboard(sources, state.sourceIds, false),
+    });
+  }
+
+  private async handleCategoryToggle(
+    ctx: Context,
+    state: WizardState,
+    raw: string,
+  ): Promise<void> {
+    const categoryId = Number(raw);
+    const categories = await this.coreApi.getCategories();
+    if (!categories.some((c) => c.id === categoryId)) {
+      await ctx.answerCallbackQuery({
+        text: 'That category is no longer available.',
+        show_alert: true,
+      });
+      return;
+    }
+
+    toggleId(state.categoryIds, categoryId);
+    await ctx.answerCallbackQuery();
+    await ctx.editMessageReplyMarkup({
+      reply_markup: categoryKeyboard(categories, state.categoryIds, false),
+    });
+  }
+
+  /** The one and only server write: a single combined save, then the full
+   * categories+sources review — used by every entry point (wizard, and
+   * both standalone categories-only/sources-only edits alike). */
+  private async finalizeWizard(
+    ctx: Context,
+    chatId: string,
+    state: WizardState,
+  ): Promise<void> {
+    const updated = await this.coreApi.updateSubscriptions(
+      chatId,
+      state.categoryIds,
+      state.sourceIds,
+    );
+    this.wizard.clear(chatId);
+
+    const [categories, sources] = await Promise.all([
+      this.coreApi.getCategories(),
+      this.coreApi.getSources(),
+    ]);
+    await ctx.editMessageText(
+      reviewMessage(
+        categories,
+        updated.categoryIds,
+        sources,
+        updated.sourceIds,
+      ),
+    );
+  }
+}

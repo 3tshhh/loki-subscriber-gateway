@@ -1,0 +1,106 @@
+import { randomUUID } from 'crypto';
+import {
+  Inject,
+  Injectable,
+  Logger,
+  OnModuleDestroy,
+  OnModuleInit,
+} from '@nestjs/common';
+import type Redis from 'ioredis';
+import {
+  CONSUMER_GROUPS,
+  REDIS_CLIENT,
+  REDIS_KEYS,
+  REDIS_STREAMS,
+  StreamConsumer,
+  StreamEntry,
+} from '../../shared/redis';
+import { NotificationsService } from '../notifications/notifications.service';
+
+interface JobPayload {
+  title?: string;
+  link?: string;
+  description?: string;
+  budget?: string;
+  [key: string]: unknown;
+}
+
+@Injectable()
+export class JobStreamService implements OnModuleInit, OnModuleDestroy {
+  private readonly logger = new Logger(JobStreamService.name);
+  private consumer: StreamConsumer;
+
+  constructor(
+    @Inject(REDIS_CLIENT) private readonly redis: Redis,
+    private readonly notifications: NotificationsService,
+  ) {}
+
+  async onModuleInit() {
+    this.consumer = new StreamConsumer(
+      this.redis,
+      REDIS_STREAMS.jobsNew,
+      CONSUMER_GROUPS.dispatch,
+      `dispatch-${process.pid}-${randomUUID()}`,
+      (entry) => this.handleJob(entry),
+    );
+    await this.consumer.start();
+  }
+
+  async onModuleDestroy() {
+    await this.consumer?.stop();
+  }
+
+  private async handleJob(entry: StreamEntry): Promise<void> {
+    const { jobId, category, source, payload } = entry.fields;
+    if (!jobId || !category || !source) {
+      this.logger.warn(`Dropping malformed jobs:new entry ${entry.id}`);
+      return;
+    }
+
+    if (await this.notifications.hasBeenProcessed(jobId)) {
+      this.logger.debug(`Job ${jobId} already processed, skipping`);
+      return;
+    }
+
+    const parsedPayload = (payload ? JSON.parse(payload) : {}) as JobPayload;
+
+    // The sub:{category}:{source} set already stores chat_ids directly (that
+    // set is kept in sync with active users by SubscriberService), so no
+    // Postgres join is needed here at all.
+    const chatIds = await this.redis.smembers(
+      REDIS_KEYS.subscriberSet(category, source),
+    );
+    if (chatIds.length === 0) {
+      this.logger.debug(
+        `Job ${jobId} (${category}/${source}) has no subscribers`,
+      );
+      return;
+    }
+
+    // Persist who is supposed to receive this job before handing it off to
+    // the telegram-bot module, so a crash between here and the XADD below
+    // never loses the record of an intended delivery.
+    await this.notifications.insertPendingForChats(jobId, chatIds);
+
+    await this.redis.xadd(
+      REDIS_STREAMS.notifyTelegram,
+      '*',
+      'jobId',
+      jobId,
+      'title',
+      parsedPayload.title ?? '',
+      'link',
+      parsedPayload.link ?? '',
+      'description',
+      parsedPayload.description ?? '',
+      'budget',
+      parsedPayload.budget ?? '',
+      'category',
+      category,
+      'source',
+      source,
+      'chatIds',
+      JSON.stringify(chatIds),
+    );
+  }
+}

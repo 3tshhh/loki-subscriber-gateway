@@ -1,0 +1,257 @@
+import { Inject, Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { Bot, Context } from 'grammy';
+import { BOT } from '../bot.provider';
+import { CoreApiClient } from '../core-api.client';
+import {
+  categoryCaption,
+  categoryKeyboard,
+  RESUME_CATEGORIES_CALLBACK,
+  RESUME_SOURCES_CALLBACK,
+  sourceCaption,
+  sourceKeyboard,
+  sourcesSummary,
+} from './selector.util';
+
+/**
+ * Ported from the pre-split bot's user_bot.py: every handler calls
+ * ensureUser first (idempotent row creation, never reactivates), /start and
+ * the "Resume" button are the only two paths that explicitly activate, and
+ * the picker is a staged categories→sources wizard rather than one combined
+ * screen — see backup/*.combined-picker.ts.bak for the previous version.
+ */
+@Injectable()
+export class TelegramCommandsService implements OnModuleInit {
+  private readonly logger = new Logger(TelegramCommandsService.name);
+
+  constructor(
+    @Inject(BOT) private readonly bot: Bot,
+    private readonly coreApi: CoreApiClient,
+  ) {}
+
+  onModuleInit() {
+    this.bot.command('start', (ctx) => this.handleStart(ctx));
+    this.bot.command('stop', (ctx) => this.handleStop(ctx));
+    this.bot.command('categories', (ctx) => this.handleCategoriesCommand(ctx));
+    this.bot.command('sources', (ctx) => this.handleSourcesCommand(ctx));
+    this.bot.on('callback_query:data', (ctx) => this.handleCallback(ctx));
+  }
+
+  private async handleStart(ctx: Context): Promise<void> {
+    if (!ctx.chat) return;
+    const chatId = String(ctx.chat.id);
+    await this.coreApi.ensureUser(chatId);
+    await this.coreApi.activateUser(chatId);
+
+    const [categories, subscriptions] = await Promise.all([
+      this.coreApi.getCategories(),
+      this.coreApi.getSubscriptions(chatId),
+    ]);
+    await ctx.reply(
+      'Welcome to Loki Jobs 👋\n\nChoose the categories you want to receive.',
+      {
+        reply_markup: categoryKeyboard(
+          categories,
+          subscriptions.categoryIds,
+          false,
+        ),
+      },
+    );
+  }
+
+  private async handleStop(ctx: Context): Promise<void> {
+    if (!ctx.chat) return;
+    const chatId = String(ctx.chat.id);
+    try {
+      await this.coreApi.ensureUser(chatId);
+      await this.coreApi.deactivateUser(chatId);
+      await ctx.reply(
+        "You've been unsubscribed from notifications. You won't receive any more job notifications.\n\n" +
+          'To start receiving jobs again, send /start.',
+      );
+    } catch (err) {
+      this.logger.error(
+        `Failed to deactivate chat ${chatId}: ${(err as Error).message}`,
+        (err as Error).stack,
+      );
+      await ctx.reply('Something went wrong, please try again.');
+    }
+  }
+
+  private async handleCategoriesCommand(ctx: Context): Promise<void> {
+    if (!ctx.chat) return;
+    const chatId = String(ctx.chat.id);
+    const { active } = await this.coreApi.ensureUser(chatId);
+    await this.renderCategoryScreen(ctx, chatId, active, false);
+  }
+
+  private async handleSourcesCommand(ctx: Context): Promise<void> {
+    if (!ctx.chat) return;
+    const chatId = String(ctx.chat.id);
+    const { active } = await this.coreApi.ensureUser(chatId);
+    await this.renderSourceScreen(ctx, chatId, active, false);
+  }
+
+  private async handleCallback(ctx: Context): Promise<void> {
+    const data = ctx.callbackQuery?.data;
+    if (!data || !ctx.chat) return;
+    const chatId = String(ctx.chat.id);
+
+    try {
+      const { active } = await this.coreApi.ensureUser(chatId);
+
+      if (
+        data === RESUME_CATEGORIES_CALLBACK ||
+        data === RESUME_SOURCES_CALLBACK
+      ) {
+        await this.coreApi.activateUser(chatId);
+        await ctx.answerCallbackQuery({ text: 'Notifications resumed ✅' });
+        if (data === RESUME_SOURCES_CALLBACK) {
+          await this.renderSourceScreen(ctx, chatId, true, true);
+        } else {
+          await this.renderCategoryScreen(ctx, chatId, true, true);
+        }
+        return;
+      }
+
+      if (data === 'done') {
+        await ctx.answerCallbackQuery();
+        await this.renderSourceScreen(ctx, chatId, active, true);
+        return;
+      }
+
+      if (data.startsWith('src:')) {
+        await this.handleSourceToggle(ctx, chatId, active, data.slice(4));
+        return;
+      }
+
+      if (!data.startsWith('cat:')) {
+        await ctx.answerCallbackQuery();
+        return;
+      }
+
+      await this.handleCategoryToggle(ctx, chatId, active, data.slice(4));
+    } catch (err) {
+      this.logger.error(
+        `Failed to handle callback ${data}: ${(err as Error).message}`,
+        (err as Error).stack,
+      );
+      await ctx.answerCallbackQuery({
+        text: 'Something went wrong, please try again.',
+      });
+    }
+  }
+
+  private async handleSourceToggle(
+    ctx: Context,
+    chatId: string,
+    active: boolean,
+    raw: string,
+  ): Promise<void> {
+    if (raw === 'done') {
+      await ctx.answerCallbackQuery();
+      const [sources, subscriptions] = await Promise.all([
+        this.coreApi.getSources(),
+        this.coreApi.getSubscriptions(chatId),
+      ]);
+      await ctx.editMessageText(
+        sourcesSummary(sources, subscriptions.sourceIds),
+      );
+      return;
+    }
+
+    const sourceId = Number(raw);
+    const sources = await this.coreApi.getSources();
+    if (!sources.some((s) => s.id === sourceId)) {
+      await ctx.answerCallbackQuery({
+        text: 'That source is no longer available.',
+        show_alert: true,
+      });
+      return;
+    }
+
+    await ctx.answerCallbackQuery();
+    const current = await this.coreApi.getSubscriptions(chatId);
+    const sourceIds = new Set(current.sourceIds);
+    if (sourceIds.has(sourceId)) sourceIds.delete(sourceId);
+    else sourceIds.add(sourceId);
+    await this.coreApi.updateSubscriptions(chatId, current.categoryIds, [
+      ...sourceIds,
+    ]);
+    await this.renderSourceScreen(ctx, chatId, active, true);
+  }
+
+  private async handleCategoryToggle(
+    ctx: Context,
+    chatId: string,
+    active: boolean,
+    raw: string,
+  ): Promise<void> {
+    const categoryId = Number(raw);
+    const categories = await this.coreApi.getCategories();
+    if (!categories.some((c) => c.id === categoryId)) {
+      await ctx.answerCallbackQuery({
+        text: 'That category is no longer available.',
+        show_alert: true,
+      });
+      return;
+    }
+
+    await ctx.answerCallbackQuery();
+    const current = await this.coreApi.getSubscriptions(chatId);
+    const categoryIds = new Set(current.categoryIds);
+    if (categoryIds.has(categoryId)) categoryIds.delete(categoryId);
+    else categoryIds.add(categoryId);
+    await this.coreApi.updateSubscriptions(
+      chatId,
+      [...categoryIds],
+      current.sourceIds,
+    );
+    await this.renderCategoryScreen(ctx, chatId, active, true);
+  }
+
+  private async renderCategoryScreen(
+    ctx: Context,
+    chatId: string,
+    active: boolean,
+    edit: boolean,
+  ): Promise<void> {
+    const [categories, subscriptions] = await Promise.all([
+      this.coreApi.getCategories(),
+      this.coreApi.getSubscriptions(chatId),
+    ]);
+    const text = categoryCaption(!active);
+    const reply_markup = categoryKeyboard(
+      categories,
+      subscriptions.categoryIds,
+      !active,
+    );
+    if (edit) {
+      await ctx.editMessageText(text, { reply_markup });
+    } else {
+      await ctx.reply(text, { reply_markup });
+    }
+  }
+
+  private async renderSourceScreen(
+    ctx: Context,
+    chatId: string,
+    active: boolean,
+    edit: boolean,
+  ): Promise<void> {
+    const [sources, subscriptions] = await Promise.all([
+      this.coreApi.getSources(),
+      this.coreApi.getSubscriptions(chatId),
+    ]);
+    const text = sourceCaption(!active);
+    const reply_markup = sourceKeyboard(
+      sources,
+      subscriptions.sourceIds,
+      !active,
+    );
+    if (edit) {
+      await ctx.editMessageText(text, { reply_markup });
+    } else {
+      await ctx.reply(text, { reply_markup });
+    }
+  }
+}

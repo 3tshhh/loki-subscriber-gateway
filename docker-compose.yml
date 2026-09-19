@@ -1,0 +1,20 @@
+services:
+  app:
+    image: etshhh/subscriber-gateway:latest
+    restart: unless-stopped
+    ports:
+      - '${PORT:-3000}:3000'
+    env_file:
+      - .env
+    environment:
+      # Postgres runs in its own separate container (subscriber-db) with its
+      # port published to the host, not bundled into this compose file.
+      # Inside a container "localhost" means the container itself, not the
+      # host machine, so it needs to point at the host instead.
+      # host.docker.internal is resolved automatically by Docker Desktop;
+      # extra_hosts below adds the same resolution on native Linux Docker.
+      # Redis is reached via REDIS_URL (from .env) instead, pointing at its
+      # own fixed address directly — no host-gateway translation needed.
+      DATABASE_HOST: host.docker.internal
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'

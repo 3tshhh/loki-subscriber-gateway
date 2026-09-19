@@ -1,0 +1,289 @@
+import { Inject, Injectable, NotFoundException } from '@nestjs/common';
+import { InjectRepository } from '@nestjs/typeorm';
+import { DataSource, In, LessThanOrEqual, Repository } from 'typeorm';
+import type Redis from 'ioredis';
+import { REDIS_CLIENT, REDIS_KEYS } from '../../shared/redis';
+import { UserEntity } from './entities/user.entity';
+import { CategoryEntity } from './entities/category.entity';
+import { SourceEntity } from './entities/source.entity';
+import { UserCategoryEntity } from './entities/user-category.entity';
+import { UserSourceEntity } from './entities/user-source.entity';
+
+/** Hard-delete deactivated users after this long, per retention policy. */
+export const RETENTION_DAYS = 30;
+
+@Injectable()
+export class SubscriberService {
+  constructor(
+    @InjectRepository(UserEntity)
+    private readonly users: Repository<UserEntity>,
+    @InjectRepository(CategoryEntity)
+    private readonly categories: Repository<CategoryEntity>,
+    @InjectRepository(SourceEntity)
+    private readonly sources: Repository<SourceEntity>,
+    @InjectRepository(UserCategoryEntity)
+    private readonly userCategories: Repository<UserCategoryEntity>,
+    @InjectRepository(UserSourceEntity)
+    private readonly userSources: Repository<UserSourceEntity>,
+    private readonly dataSource: DataSource,
+    @Inject(REDIS_CLIENT) private readonly redis: Redis,
+  ) {}
+
+  /**
+   * Upserts a user on /start. A user reactivating after /stop gets their old
+   * category/source selection (still intact in Postgres) restored into the
+   * Redis subscriber sets, rather than starting from scratch.
+   */
+  async findOrCreateUser(chatId: string): Promise<UserEntity> {
+    const existing = await this.users.findOne({ where: { chatId } });
+
+    if (existing) {
+      if (!existing.active) {
+        existing.active = true;
+        existing.deactivatedAt = null;
+        await this.users.save(existing);
+        await this.restoreRedisMemberships(chatId);
+      }
+      await this.redis.sadd(REDIS_KEYS.activeUsers, chatId);
+      return existing;
+    }
+
+    const created = await this.users.save(
+      this.users.create({ chatId, active: true, deactivatedAt: null }),
+    );
+    await this.redis.sadd(REDIS_KEYS.activeUsers, chatId);
+    return created;
+  }
+
+  async getEnabledCategories(): Promise<CategoryEntity[]> {
+    return this.categories.find({ where: { enabled: true } });
+  }
+
+  async getEnabledSources(): Promise<SourceEntity[]> {
+    return this.sources.find({ where: { enabled: true } });
+  }
+
+  async getUserSubscriptions(
+    chatId: string,
+  ): Promise<{ categoryIds: number[]; sourceIds: number[] }> {
+    const user = await this.getUserOrThrow(chatId);
+    const [cats, srcs] = await Promise.all([
+      this.userCategories.find({ where: { chatId: user.chatId } }),
+      this.userSources.find({ where: { chatId: user.chatId } }),
+    ]);
+    return {
+      categoryIds: cats.map((c) => c.categoryId),
+      sourceIds: srcs.map((s) => s.sourceId),
+    };
+  }
+
+  /**
+   * Replaces the user's category/source selection and reconciles the
+   * `sub:{category}:{source}` Redis sets by SADD/SREM-ing only the delta
+   * between the old and new cartesian products — never a blind rebuild.
+   */
+  async updateSubscriptions(
+    chatId: string,
+    categoryIds: number[],
+    sourceIds: number[],
+  ): Promise<void> {
+    const user = await this.getUserOrThrow(chatId);
+
+    const [oldCategoryIds, oldSourceIds] = await Promise.all([
+      this.userCategories
+        .find({ where: { chatId: user.chatId } })
+        .then((rows) => rows.map((r) => r.categoryId)),
+      this.userSources
+        .find({ where: { chatId: user.chatId } })
+        .then((rows) => rows.map((r) => r.sourceId)),
+    ]);
+
+    const allCategoryIds = [...new Set([...oldCategoryIds, ...categoryIds])];
+    const allSourceIds = [...new Set([...oldSourceIds, ...sourceIds])];
+    const [categoryNameById, sourceNameById] = await Promise.all([
+      this.namesById(this.categories, allCategoryIds),
+      this.namesById(this.sources, allSourceIds),
+    ]);
+
+    const oldPairs = cartesianPairs(
+      oldCategoryIds,
+      oldSourceIds,
+      categoryNameById,
+      sourceNameById,
+    );
+    const newPairs = cartesianPairs(
+      categoryIds,
+      sourceIds,
+      categoryNameById,
+      sourceNameById,
+    );
+
+    const toAdd = [...newPairs.entries()].filter(([key]) => !oldPairs.has(key));
+    const toRemove = [...oldPairs.entries()].filter(
+      ([key]) => !newPairs.has(key),
+    );
+
+    await this.dataSource.transaction(async (manager) => {
+      await manager.delete(UserCategoryEntity, { chatId: user.chatId });
+      await manager.delete(UserSourceEntity, { chatId: user.chatId });
+      if (categoryIds.length > 0) {
+        await manager.insert(
+          UserCategoryEntity,
+          categoryIds.map((categoryId) => ({
+            chatId: user.chatId,
+            categoryId,
+          })),
+        );
+      }
+      if (sourceIds.length > 0) {
+        await manager.insert(
+          UserSourceEntity,
+          sourceIds.map((sourceId) => ({ chatId: user.chatId, sourceId })),
+        );
+      }
+    });
+
+    await this.applyRedisDiff(user.chatId, toAdd, toRemove);
+  }
+
+  /**
+   * Soft-deactivation, shared by the explicit /stop command and the
+   * telegram-bot module reporting a delivery as permanently unreachable
+   * (bot blocked). Removes the user from every subscriber set and the
+   * active-users set, but keeps their category/source rows so /start can
+   * restore them later. Hard deletion only happens via the retention sweep.
+   */
+  async deactivateUser(chatId: string): Promise<void> {
+    const user = await this.getUserOrThrow(chatId);
+    await this.clearRedisMemberships(chatId);
+    await this.redis.srem(REDIS_KEYS.activeUsers, chatId);
+
+    user.active = false;
+    user.deactivatedAt = new Date();
+    await this.users.save(user);
+  }
+
+  /**
+   * Daily retention sweep: hard-deletes users who have been deactivated for
+   * longer than RETENTION_DAYS. Postgres FKs (ON DELETE CASCADE) take care
+   * of user_categories/user_sources/notifications; nothing is left in Redis
+   * to clean up since deactivateUser already removed it there.
+   */
+  async hardDeleteExpiredDeactivations(): Promise<number> {
+    const cutoff = new Date(Date.now() - RETENTION_DAYS * 24 * 60 * 60 * 1000);
+    const result = await this.users.delete({
+      active: false,
+      deactivatedAt: LessThanOrEqual(cutoff),
+    });
+    return result.affected ?? 0;
+  }
+
+  private async restoreRedisMemberships(chatId: string): Promise<void> {
+    const [categoryRows, sourceRows] = await Promise.all([
+      this.userCategories.find({ where: { chatId } }),
+      this.userSources.find({ where: { chatId } }),
+    ]);
+    if (categoryRows.length === 0 || sourceRows.length === 0) return;
+
+    const [categoryNameById, sourceNameById] = await Promise.all([
+      this.namesById(
+        this.categories,
+        categoryRows.map((r) => r.categoryId),
+      ),
+      this.namesById(
+        this.sources,
+        sourceRows.map((r) => r.sourceId),
+      ),
+    ]);
+    const pairs = cartesianPairs(
+      categoryRows.map((r) => r.categoryId),
+      sourceRows.map((r) => r.sourceId),
+      categoryNameById,
+      sourceNameById,
+    );
+    await this.applyRedisDiff(chatId, [...pairs.entries()], []);
+  }
+
+  private async clearRedisMemberships(chatId: string): Promise<void> {
+    const [categoryRows, sourceRows] = await Promise.all([
+      this.userCategories.find({ where: { chatId } }),
+      this.userSources.find({ where: { chatId } }),
+    ]);
+    if (categoryRows.length === 0 || sourceRows.length === 0) return;
+
+    const [categoryNameById, sourceNameById] = await Promise.all([
+      this.namesById(
+        this.categories,
+        categoryRows.map((r) => r.categoryId),
+      ),
+      this.namesById(
+        this.sources,
+        sourceRows.map((r) => r.sourceId),
+      ),
+    ]);
+    const pairs = cartesianPairs(
+      categoryRows.map((r) => r.categoryId),
+      sourceRows.map((r) => r.sourceId),
+      categoryNameById,
+      sourceNameById,
+    );
+    await this.applyRedisDiff(chatId, [], [...pairs.entries()]);
+  }
+
+  private async applyRedisDiff(
+    chatId: string,
+    toAdd: [string, [string, string]][],
+    toRemove: [string, [string, string]][],
+  ): Promise<void> {
+    if (toAdd.length === 0 && toRemove.length === 0) return;
+    const pipeline = this.redis.pipeline();
+    for (const [, [category, source]] of toAdd) {
+      pipeline.sadd(REDIS_KEYS.subscriberSet(category, source), chatId);
+    }
+    for (const [, [category, source]] of toRemove) {
+      pipeline.srem(REDIS_KEYS.subscriberSet(category, source), chatId);
+    }
+    await pipeline.exec();
+  }
+
+  private async getUserOrThrow(chatId: string): Promise<UserEntity> {
+    const user = await this.users.findOne({ where: { chatId } });
+    if (!user) {
+      throw new NotFoundException(`No user with chatId=${chatId}`);
+    }
+    return user;
+  }
+
+  private async namesById(
+    repo: Repository<CategoryEntity> | Repository<SourceEntity>,
+    ids: number[],
+  ): Promise<Map<number, string>> {
+    if (ids.length === 0) return new Map();
+    const rows = await repo.find({ where: { id: In(ids) } });
+    return new Map(rows.map((r) => [r.id, r.name]));
+  }
+}
+
+/**
+ * Cartesian product of category/source ids, keyed by the numeric id pair
+ * (not the names) so redis-key characters in a category/source name can
+ * never cause two distinct pairs to collide.
+ */
+function cartesianPairs(
+  categoryIds: number[],
+  sourceIds: number[],
+  categoryNameById: Map<number, string>,
+  sourceNameById: Map<number, string>,
+): Map<string, [category: string, source: string]> {
+  const pairs = new Map<string, [string, string]>();
+  for (const categoryId of categoryIds) {
+    const categoryName = categoryNameById.get(categoryId);
+    if (!categoryName) continue;
+    for (const sourceId of sourceIds) {
+      const sourceName = sourceNameById.get(sourceId);
+      if (!sourceName) continue;
+      pairs.set(`${categoryId}:${sourceId}`, [categoryName, sourceName]);
+    }
+  }
+  return pairs;
+}

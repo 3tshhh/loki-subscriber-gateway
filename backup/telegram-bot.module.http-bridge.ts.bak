@@ -1,0 +1,21 @@
+import { Module } from '@nestjs/common';
+import { HttpModule } from '@nestjs/axios';
+import { botProvider } from './bot.provider';
+import { CoreApiClient } from './core-api.client';
+import { TelegramBootstrapService } from './telegram-bootstrap.service';
+import { TelegramCommandsService } from './commands/telegram-commands.service';
+import { WizardStateStore } from './commands/wizard-state.store';
+import { TelegramDispatchService } from './dispatch/telegram-dispatch.service';
+
+@Module({
+  imports: [HttpModule],
+  providers: [
+    botProvider,
+    CoreApiClient,
+    TelegramBootstrapService,
+    TelegramCommandsService,
+    WizardStateStore,
+    TelegramDispatchService,
+  ],
+})
+export class TelegramBotModule {}

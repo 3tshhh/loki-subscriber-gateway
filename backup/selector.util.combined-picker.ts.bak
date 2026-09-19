@@ -1,0 +1,47 @@
+import { InlineKeyboard } from 'grammy';
+import { CategoryDto, SourceDto } from '../core-api.client';
+
+export type SelectorMode = 'both' | 'categories' | 'sources';
+
+export function buildSelectorKeyboard(
+  mode: SelectorMode,
+  categories: CategoryDto[],
+  selectedCategoryIds: number[],
+  sources: SourceDto[],
+  selectedSourceIds: number[],
+): InlineKeyboard {
+  const keyboard = new InlineKeyboard();
+  const selectedCategories = new Set(selectedCategoryIds);
+  const selectedSources = new Set(selectedSourceIds);
+
+  if (mode === 'both' || mode === 'categories') {
+    for (const category of categories) {
+      const mark = selectedCategories.has(category.id) ? '✅ ' : '';
+      keyboard
+        .text(`${mark}${category.name}`, `toggle:cat:${category.id}:${mode}`)
+        .row();
+    }
+  }
+
+  if (mode === 'both' || mode === 'sources') {
+    for (const source of sources) {
+      const mark = selectedSources.has(source.id) ? '✅ ' : '';
+      keyboard
+        .text(`${mark}${source.name}`, `toggle:src:${source.id}:${mode}`)
+        .row();
+    }
+  }
+
+  return keyboard;
+}
+
+export function selectorCaption(mode: SelectorMode): string {
+  switch (mode) {
+    case 'categories':
+      return 'Tap a category to subscribe or unsubscribe:';
+    case 'sources':
+      return 'Tap a source to subscribe or unsubscribe:';
+    default:
+      return 'Choose the categories and sources you want to be notified about:';
+  }
+}
