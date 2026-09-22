@@ -42,10 +42,16 @@ export class NotificationsService {
     chatId: string,
     status: NotificationStatus,
     reason: NotificationReason | null = null,
+    responseTimeMs: number | null = null,
   ): Promise<void> {
     await this.notifications.update(
       { jobId, chatId },
-      { status, sentAt: status === 'sent' ? new Date() : null, reason },
+      {
+        status,
+        sentAt: status === 'sent' ? new Date() : null,
+        reason,
+        responseTimeMs: status === 'sent' ? responseTimeMs : null,
+      },
     );
   }
 }

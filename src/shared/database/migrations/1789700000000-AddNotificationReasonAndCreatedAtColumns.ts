@@ -10,9 +10,7 @@ import { MigrationInterface, QueryRunner } from 'typeorm';
  * to fabricate a creation time for them; new rows get it set at insert
  * time via the entity.
  */
-export class AddNotificationReasonAndCreatedAtColumns1789700000000
-  implements MigrationInterface
-{
+export class AddNotificationReasonAndCreatedAtColumns1789700000000 implements MigrationInterface {
   name = 'AddNotificationReasonAndCreatedAtColumns1789700000000';
 
   public async up(queryRunner: QueryRunner): Promise<void> {
@@ -24,9 +22,7 @@ export class AddNotificationReasonAndCreatedAtColumns1789700000000
     await queryRunner.query(
       `ALTER TABLE "categories" ADD "created_at" TIMESTAMP`,
     );
-    await queryRunner.query(
-      `ALTER TABLE "sources" ADD "created_at" TIMESTAMP`,
-    );
+    await queryRunner.query(`ALTER TABLE "sources" ADD "created_at" TIMESTAMP`);
     await queryRunner.query(
       `ALTER TABLE "user_categories" ADD "created_at" TIMESTAMP`,
     );
@@ -42,15 +38,11 @@ export class AddNotificationReasonAndCreatedAtColumns1789700000000
     await queryRunner.query(
       `ALTER TABLE "user_categories" DROP COLUMN "created_at"`,
     );
-    await queryRunner.query(
-      `ALTER TABLE "sources" DROP COLUMN "created_at"`,
-    );
+    await queryRunner.query(`ALTER TABLE "sources" DROP COLUMN "created_at"`);
     await queryRunner.query(
       `ALTER TABLE "categories" DROP COLUMN "created_at"`,
     );
 
-    await queryRunner.query(
-      `ALTER TABLE "notifications" DROP COLUMN "reason"`,
-    );
+    await queryRunner.query(`ALTER TABLE "notifications" DROP COLUMN "reason"`);
   }
 }

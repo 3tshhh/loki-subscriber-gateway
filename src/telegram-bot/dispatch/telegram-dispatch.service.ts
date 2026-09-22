@@ -229,8 +229,9 @@ export class TelegramDispatchService implements OnModuleInit, OnModuleDestroy {
     // on must never cause this entry to be retried — that would resend a
     // message the recipient already got. The claim was already made before
     // sending, so there's nothing left to record here.
-    await this.reportStatus(jobId, chatId, 'sent');
-    this.logDelivery(job, chatId, true);
+    const endToEndMs = Date.now() - job.enqueuedAtMs;
+    await this.reportStatus(jobId, chatId, 'sent', null, endToEndMs);
+    this.logDelivery(job, chatId, true, endToEndMs);
   }
 
   /**
@@ -244,9 +245,9 @@ export class TelegramDispatchService implements OnModuleInit, OnModuleDestroy {
     job: NotifyTelegramFields,
     chatId: string,
     ok: boolean,
+    endToEndMs: number = Date.now() - job.enqueuedAtMs,
   ): void {
     if (!this.loggingEnabled) return;
-    const endToEndMs = Date.now() - job.enqueuedAtMs;
     console.log(
       [
         colorModule('TELEGRAM-BOT'),
@@ -322,9 +323,16 @@ export class TelegramDispatchService implements OnModuleInit, OnModuleDestroy {
     chatId: string,
     status: 'sent' | 'failed',
     reason: NotificationReason | null = null,
+    responseTimeMs: number | null = null,
   ): Promise<void> {
     try {
-      await this.botData.setNotificationStatus(jobId, chatId, status, reason);
+      await this.botData.setNotificationStatus(
+        jobId,
+        chatId,
+        status,
+        reason,
+        responseTimeMs,
+      );
     } catch (err) {
       this.logger.error(
         `Failed to report status=${status} for job ${jobId} chat ${chatId} to core: ${(err as Error).message}`,

@@ -1,4 +1,4 @@
-import { IsEnum, IsIn, IsOptional } from 'class-validator';
+import { IsEnum, IsIn, IsInt, IsOptional } from 'class-validator';
 import {
   NotificationReason,
   NotificationStatus,
@@ -11,4 +11,8 @@ export class UpdateNotificationStatusDto {
   @IsOptional()
   @IsEnum(NotificationReason)
   reason?: NotificationReason;
+
+  @IsOptional()
+  @IsInt()
+  responseTimeMs?: number;
 }

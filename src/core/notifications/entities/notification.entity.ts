@@ -48,4 +48,11 @@ export class NotificationEntity {
   /** Null for `pending`/`sent` rows — only ever set alongside `failed`/`cancelled`. */
   @Column({ type: 'text', nullable: true })
   reason: NotificationReason | null;
+
+  /** End-to-end latency in ms — from the job's own jobs:notify timestamp to
+   * the moment this recipient's send resolved, the same number logged to
+   * the terminal (see logDelivery in telegram-dispatch.service.ts). Only
+   * ever set alongside `sent`; null otherwise. */
+  @Column({ name: 'response_time_ms', type: 'int', nullable: true })
+  responseTimeMs: number | null;
 }

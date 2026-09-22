@@ -21,7 +21,14 @@ export class NotificationsController {
       chatId,
       dto.status,
       dto.reason ?? null,
+      dto.responseTimeMs ?? null,
     );
-    return { jobId, chatId, status: dto.status, reason: dto.reason ?? null };
+    return {
+      jobId,
+      chatId,
+      status: dto.status,
+      reason: dto.reason ?? null,
+      responseTimeMs: dto.responseTimeMs ?? null,
+    };
   }
 }
