@@ -22,6 +22,7 @@ import {
 } from '../../shared/redis';
 import { BOT } from '../bot.provider';
 import { BotSubscriberService } from '../bot-subscriber.service';
+import { NotificationReason } from '../../core/notifications/entities/notification.entity';
 import { buildJobMessage, safeButtonUrl } from './message-builder';
 import {
   colorDeliveryDuration,
@@ -84,6 +85,7 @@ export class TelegramDispatchService implements OnModuleInit, OnModuleDestroy {
       {
         maxDeliveryAttempts: MAX_DELIVERY_ATTEMPTS,
         deadLetterStream: REDIS_STREAMS.notifyTelegramDead,
+        onDeadLetter: (fields) => this.handleDeadLetter(fields),
       },
     );
     await this.consumer.start();
@@ -199,8 +201,16 @@ export class TelegramDispatchService implements OnModuleInit, OnModuleDestroy {
         this.logger.warn(`Chat ${chatId} blocked the bot, deactivating`);
         // No send happened, but we're never retrying this recipient either
         // — keep the claim in place so a reclaim of this entry skips them.
-        await this.reportStatus(jobId, chatId, 'failed');
-        await this.botData.deactivateUser(chatId);
+        await this.reportStatus(
+          jobId,
+          chatId,
+          'failed',
+          NotificationReason.BOT_BLOCKED,
+        );
+        await this.botData.deactivateUser(
+          chatId,
+          NotificationReason.BOT_BLOCKED,
+        );
         this.logDelivery(job, chatId, false);
         return;
       }
@@ -311,12 +321,35 @@ export class TelegramDispatchService implements OnModuleInit, OnModuleDestroy {
     jobId: string,
     chatId: string,
     status: 'sent' | 'failed',
+    reason: NotificationReason | null = null,
   ): Promise<void> {
     try {
-      await this.botData.setNotificationStatus(jobId, chatId, status);
+      await this.botData.setNotificationStatus(jobId, chatId, status, reason);
     } catch (err) {
       this.logger.error(
         `Failed to report status=${status} for job ${jobId} chat ${chatId} to core: ${(err as Error).message}`,
+      );
+    }
+  }
+
+  /**
+   * Called by StreamConsumer right before it dead-letters a notify:telegram
+   * entry that exhausted its XCLAIM retries — the entry's own fields still
+   * carry jobId/chatIds, so the still-`pending` recipients among them (some
+   * may have already succeeded/been blocked/been cancelled) get marked
+   * `failed` with a reason instead of being left `pending` forever.
+   */
+  private async handleDeadLetter(
+    fields: Record<string, string>,
+  ): Promise<void> {
+    const { jobId, chatIds } = fields;
+    if (!jobId || !chatIds) return;
+    try {
+      const recipients = JSON.parse(chatIds) as string[];
+      await this.botData.markDeliveryRetriesExhausted(jobId, recipients);
+    } catch (err) {
+      this.logger.error(
+        `Failed to mark delivery-retries-exhausted for job ${jobId}: ${(err as Error).message}`,
       );
     }
   }

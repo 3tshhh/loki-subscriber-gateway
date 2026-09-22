@@ -5,7 +5,10 @@ import type Redis from 'ioredis';
 import { REDIS_CLIENT, REDIS_KEYS } from '../shared/redis';
 import { UserCategoryEntity } from '../core/subscriber/entities/user-category.entity';
 import { UserSourceEntity } from '../core/subscriber/entities/user-source.entity';
-import { NotificationEntity } from '../core/notifications/entities/notification.entity';
+import {
+  NotificationEntity,
+  NotificationReason,
+} from '../core/notifications/entities/notification.entity';
 
 export interface CategoryDto {
   id: string;
@@ -133,11 +136,16 @@ export class BotSubscriberService {
   }
 
   /**
-   * /stop's write — also called after the reply. Tolerant of a chat_id
-   * that was never actually a subscriber (no row to deactivate is treated
-   * as success, not an error worth telling the user to retry).
+   * /stop's write (reason: USER_UNSUBSCRIBED) — also the write for the
+   * auto-deactivation that follows a Telegram 403 (reason: BOT_BLOCKED),
+   * both called after their respective replies/logging. Tolerant of a
+   * chat_id that was never actually a subscriber (no row to deactivate is
+   * treated as success, not an error worth telling the user to retry).
    */
-  async deactivateUser(chatId: string): Promise<void> {
+  async deactivateUser(
+    chatId: string,
+    reason: NotificationReason,
+  ): Promise<void> {
     await this.redis.srem(REDIS_KEYS.activeUsers, chatId);
 
     await this.dataSource.transaction(async (manager) => {
@@ -148,8 +156,8 @@ export class BotSubscriberService {
       const rowCount = queryResult[1];
       if (rowCount === 0) return; // never existed — nothing to cancel either
       await manager.query(
-        `UPDATE notifications SET status = 'cancelled' WHERE chat_id = $1 AND status = 'pending'`,
-        [chatId],
+        `UPDATE notifications SET status = 'cancelled', reason = $2 WHERE chat_id = $1 AND status = 'pending'`,
+        [chatId, reason],
       );
     });
   }
@@ -195,10 +203,35 @@ export class BotSubscriberService {
     jobId: string,
     chatId: string,
     status: 'sent' | 'failed',
+    reason: NotificationReason | null = null,
   ): Promise<void> {
     await this.notifications.update(
       { jobId, chatId },
-      { status, sentAt: status === 'sent' ? new Date() : null },
+      { status, sentAt: status === 'sent' ? new Date() : null, reason },
     );
+  }
+
+  /**
+   * Bulk write for a dead-lettered notify:telegram entry (exhausted its
+   * XCLAIM retries without ever sending) — only rows still `pending` are
+   * touched, since some recipients in the same job may have already
+   * succeeded, been blocked, or been cancelled before the entry died.
+   */
+  async markDeliveryRetriesExhausted(
+    jobId: string,
+    chatIds: string[],
+  ): Promise<void> {
+    if (chatIds.length === 0) return;
+    await this.notifications
+      .createQueryBuilder()
+      .update()
+      .set({
+        status: 'failed',
+        reason: NotificationReason.DELIVERY_RETRIES_EXHAUSTED,
+      })
+      .where('job_id = :jobId', { jobId })
+      .andWhere('chat_id IN (:...chatIds)', { chatIds })
+      .andWhere('status = :pending', { pending: 'pending' })
+      .execute();
   }
 }

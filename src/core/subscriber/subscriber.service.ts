@@ -13,7 +13,10 @@ import { CategoryEntity } from './entities/category.entity';
 import { SourceEntity } from './entities/source.entity';
 import { UserCategoryEntity } from './entities/user-category.entity';
 import { UserSourceEntity } from './entities/user-source.entity';
-import { NotificationEntity } from '../notifications/entities/notification.entity';
+import {
+  NotificationEntity,
+  NotificationReason,
+} from '../notifications/entities/notification.entity';
 
 /** Hard-delete deactivated users after this long, per retention policy. */
 export const RETENTION_DAYS = 30;
@@ -198,7 +201,10 @@ export class SubscriberService {
    * resubscribe doesn't trigger a burst of stale jobs. Hard deletion only
    * happens via the retention sweep.
    */
-  async deactivateUser(chatId: string): Promise<void> {
+  async deactivateUser(
+    chatId: string,
+    reason: NotificationReason = NotificationReason.USER_UNSUBSCRIBED,
+  ): Promise<void> {
     const user = await this.getUserOrThrow(chatId);
     await this.redis.srem(REDIS_KEYS.activeUsers, chatId);
 
@@ -211,7 +217,7 @@ export class SubscriberService {
       await manager.update(
         NotificationEntity,
         { chatId: user.chatId, status: 'pending' },
-        { status: 'cancelled' },
+        { status: 'cancelled', reason },
       );
     });
   }

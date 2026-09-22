@@ -56,6 +56,13 @@ export class StreamConsumer {
       /** Stream poison entries are moved to. Required if maxDeliveryAttempts
        * is set. */
       deadLetterStream?: string;
+      /** Called once per entry, with its original fields, right before it's
+       * moved to deadLetterStream and acked — lets a caller record its own
+       * domain-specific "this gave up permanently" outcome (e.g. marking a
+       * DB row failed) without this generic consumer knowing anything about
+       * that domain. Failures here are logged and swallowed; they never
+       * block the dead-lettering itself. */
+      onDeadLetter?: (fields: Record<string, string>) => Promise<void>;
       /** Caps how much undelivered backlog this group is handed on startup.
        * If more than this many entries piled up after this group's
        * last-delivered-id while nothing was consuming, the oldest excess is
@@ -313,6 +320,16 @@ export class StreamConsumer {
 
     for (const [id, flat] of claimed) {
       const fields = fieldsToObject(flat);
+
+      if (this.options.onDeadLetter) {
+        await this.options.onDeadLetter(fields).catch((err: Error) => {
+          this.logger.error(
+            `onDeadLetter callback failed for ${this.stream}#${id}: ${err.message}`,
+            err.stack,
+          );
+        });
+      }
+
       await this.redis.xadd(
         this.options.deadLetterStream,
         '*',

@@ -1,4 +1,10 @@
-import { Entity, JoinColumn, ManyToOne, PrimaryColumn } from 'typeorm';
+import {
+  CreateDateColumn,
+  Entity,
+  JoinColumn,
+  ManyToOne,
+  PrimaryColumn,
+} from 'typeorm';
 import { UserEntity } from './user.entity';
 import { CategoryEntity } from './category.entity';
 
@@ -17,4 +23,8 @@ export class UserCategoryEntity {
   @ManyToOne(() => CategoryEntity, { onDelete: 'CASCADE' })
   @JoinColumn({ name: 'category_id' })
   category: CategoryEntity;
+
+  /** Nullable since rows created before this column existed have none. */
+  @CreateDateColumn({ name: 'created_at', nullable: true })
+  createdAt: Date | null = null;
 }

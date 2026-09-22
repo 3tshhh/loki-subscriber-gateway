@@ -40,8 +40,12 @@ class EnvironmentVariables {
   @IsString()
   REDIS_URL: string;
 
-  @IsString()
-  CORE_BASE_URL: string = 'http://localhost:3000';
+  /** Caps how much undelivered backlog jobs:notify/jobs:delivering will
+   * accept on startup before treating the excess as too stale to process —
+   * see StreamConsumer's maxBacklogOnStartup option. */
+  @IsInt()
+  @IsOptional()
+  JOB_STREAM_BACKLOG_CAP: number = 250;
 
   @IsString()
   TELEGRAM_BOT_TOKEN: string;

@@ -16,7 +16,12 @@ export class NotificationsController {
     @Param('chatId') chatId: string,
     @Body() dto: UpdateNotificationStatusDto,
   ) {
-    await this.notifications.setStatus(jobId, chatId, dto.status);
-    return { jobId, chatId, status: dto.status };
+    await this.notifications.setStatus(
+      jobId,
+      chatId,
+      dto.status,
+      dto.reason ?? null,
+    );
+    return { jobId, chatId, status: dto.status, reason: dto.reason ?? null };
   }
 }

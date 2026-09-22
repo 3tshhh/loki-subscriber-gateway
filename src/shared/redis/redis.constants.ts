@@ -1,7 +1,6 @@
 export const REDIS_CLIENT = Symbol('REDIS_CLIENT');
 
 export const REDIS_KEYS = {
-  jobAdded: (jobId: string) => `job:added:${jobId}`,
   /** Set of every currently-active chat_id, checked by dispatch before sending. */
   activeUsers: 'users:active',
   /**

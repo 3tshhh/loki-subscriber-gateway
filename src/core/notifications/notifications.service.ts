@@ -3,6 +3,7 @@ import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import {
   NotificationEntity,
+  NotificationReason,
   NotificationStatus,
 } from './entities/notification.entity';
 
@@ -40,10 +41,11 @@ export class NotificationsService {
     jobId: string,
     chatId: string,
     status: NotificationStatus,
+    reason: NotificationReason | null = null,
   ): Promise<void> {
     await this.notifications.update(
       { jobId, chatId },
-      { status, sentAt: status === 'sent' ? new Date() : null },
+      { status, sentAt: status === 'sent' ? new Date() : null, reason },
     );
   }
 }

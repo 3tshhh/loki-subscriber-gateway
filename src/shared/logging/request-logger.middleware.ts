@@ -27,7 +27,7 @@ export class RequestLoggerMiddleware implements NestMiddleware {
       const durationMs = Number(process.hrtime.bigint() - start) / 1_000_000;
       console.log(
         [
-          colorModule(resolveModule(req.path)),
+          colorModule('CORE'),
           colorMethod(req.method),
           req.originalUrl,
           colorStatus(res.statusCode),
@@ -37,8 +37,4 @@ export class RequestLoggerMiddleware implements NestMiddleware {
     });
     next();
   }
-}
-
-function resolveModule(path: string): 'CORE' | 'TELEGRAM-BOT' {
-  return path.startsWith('/telegram') ? 'TELEGRAM-BOT' : 'CORE';
 }

@@ -2,6 +2,7 @@ import { Inject, Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { Bot, Context, GrammyError } from 'grammy';
 import { BOT } from '../bot.provider';
 import { BotSubscriberService } from '../bot-subscriber.service';
+import { NotificationReason } from '../../core/notifications/entities/notification.entity';
 import {
   categoryCaption,
   categoryKeyboard,
@@ -99,17 +100,19 @@ export class TelegramCommandsService implements OnModuleInit {
         'To start receiving jobs again, send /start.',
     );
 
-    this.botData.deactivateUser(chatId).catch((err: Error) => {
-      this.logger.error(
-        `Failed to deactivate chat ${chatId} after /stop: ${err.message}`,
-        err.stack,
-      );
-      ctx
-        .reply(
-          'Something went wrong unsubscribing you — please send /stop again to make sure it goes through.',
-        )
-        .catch(() => {});
-    });
+    this.botData
+      .deactivateUser(chatId, NotificationReason.USER_UNSUBSCRIBED)
+      .catch((err: Error) => {
+        this.logger.error(
+          `Failed to deactivate chat ${chatId} after /stop: ${err.message}`,
+          err.stack,
+        );
+        ctx
+          .reply(
+            'Something went wrong unsubscribing you — please send /stop again to make sure it goes through.',
+          )
+          .catch(() => {});
+      });
   }
 
   private async handleCategoriesCommand(ctx: Context): Promise<void> {
