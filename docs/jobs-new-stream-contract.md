@@ -230,5 +230,7 @@ string equality in Postgres, with no normalization on either side — keeping
 ids to one plain format means there's no case or whitespace variant for the
 producer to get subtly wrong. Ids are capped at 60 characters, because they
 also appear verbatim in the bot's button callback data (`cat:<id>` /
-`src:<id>`), which Telegram limits to 64 bytes. Returns 409 if the id
-already exists.
+`src:<id>`), which Telegram limits to 64 bytes. `done` is reserved (400):
+the sources picker's Done button is `src:done`, so a source with that id
+would be indistinguishable from it (reserved for categories too, to keep
+the two pickers symmetric). Returns 409 if the id already exists.

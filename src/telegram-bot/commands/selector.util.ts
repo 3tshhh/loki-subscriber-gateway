@@ -3,6 +3,7 @@ import {
   CategoryDto,
   SourceDto,
 } from '../../core/subscriber/subscriber.service';
+import { PICKER_DONE_ID } from '../../core/subscriber/dto/reserved-ids';
 
 /**
  * Ported from the pre-split bot's user_bot.py: a staged wizard (categories
@@ -13,6 +14,14 @@ import {
  */
 export const RESUME_CATEGORIES_CALLBACK = 'reactivate:cat';
 export const RESUME_SOURCES_CALLBACK = 'reactivate:src';
+
+/**
+ * The pickers' Done buttons. The sources one shares the `src:` prefix with
+ * every source button, which is why PICKER_DONE_ID is a reserved id that
+ * CreateSourceDto/CreateCategoryDto reject (see reserved-ids.ts).
+ */
+export const CATEGORIES_DONE_CALLBACK = PICKER_DONE_ID;
+export const SOURCES_DONE_CALLBACK = `src:${PICKER_DONE_ID}`;
 
 const INACTIVE_NOTICE =
   "⏸ You're currently unsubscribed from notifications.\n" +
@@ -32,7 +41,7 @@ export function categoryKeyboard(
     const mark = selected.has(category.id) ? '✅' : '⬜';
     keyboard.text(`${mark} ${category.name}`, `cat:${category.id}`).row();
   }
-  keyboard.text('Done', 'done');
+  keyboard.text('Done', CATEGORIES_DONE_CALLBACK);
   return keyboard;
 }
 
@@ -58,7 +67,7 @@ export function sourceKeyboard(
     const mark = selected.has(source.id) ? '✅' : '⬜';
     keyboard.text(`${mark} ${source.name}`, `src:${source.id}`).row();
   }
-  keyboard.text('Done', 'src:done');
+  keyboard.text('Done', SOURCES_DONE_CALLBACK);
   return keyboard;
 }
 

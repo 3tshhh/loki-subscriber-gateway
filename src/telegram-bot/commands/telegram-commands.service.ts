@@ -4,11 +4,13 @@ import { BOT } from '../bot.provider';
 import { SubscriberService } from '../../core/subscriber/subscriber.service';
 import { NotificationReason } from '../../core/notifications/entities/notification.entity';
 import {
+  CATEGORIES_DONE_CALLBACK,
   categoryCaption,
   categoryKeyboard,
   RESUME_CATEGORIES_CALLBACK,
   RESUME_SOURCES_CALLBACK,
   reviewMessage,
+  SOURCES_DONE_CALLBACK,
   sourceCaption,
   sourceKeyboard,
 } from './selector.util';
@@ -182,12 +184,12 @@ export class TelegramCommandsService implements OnModuleInit {
         return;
       }
 
-      if (data === 'done') {
+      if (data === CATEGORIES_DONE_CALLBACK) {
         await this.handleCategoriesDone(ctx, chatId, state);
         return;
       }
 
-      if (data === 'src:done') {
+      if (data === SOURCES_DONE_CALLBACK) {
         await ctx.answerCallbackQuery();
         await this.finalizeWizard(ctx, chatId, state);
         return;
