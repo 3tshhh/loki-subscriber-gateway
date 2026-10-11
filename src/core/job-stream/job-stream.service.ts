@@ -12,6 +12,7 @@ import { DataSource } from 'typeorm';
 import {
   CONSUMER_GROUPS,
   DEFAULT_STARTUP_BACKLOG_CAP,
+  MAX_DELIVERY_ATTEMPTS,
   REDIS_CLIENT,
   REDIS_STREAMS,
   StreamConsumer,
@@ -64,7 +65,18 @@ export class JobStreamService implements OnModuleInit, OnModuleDestroy {
       CONSUMER_GROUPS.delivering,
       `worker-${process.pid}-${randomUUID()}`,
       (entry) => this.handleJob(entry),
-      { maxBacklogOnStartup: backlogCap },
+      {
+        maxBacklogOnStartup: backlogCap,
+        // Without a cap, an entry whose handling keeps throwing (Postgres
+        // unreachable for it, a bug tripped by one specific payload, ...)
+        // would be reclaimed and re-failed on every pending-entries sweep
+        // forever. Past MAX_DELIVERY_ATTEMPTS it's parked on the
+        // dead-letter stream instead, where it can be inspected and
+        // replayed by hand.
+        maxDeliveryAttempts: MAX_DELIVERY_ATTEMPTS,
+        deadLetterStream: REDIS_STREAMS.jobsDeliveringDead,
+        onDeadLetter: (fields) => this.removeDeadLetteredEntry(fields),
+      },
     );
     await this.consumer.start();
   }
@@ -92,27 +104,81 @@ export class JobStreamService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
-    if (await this.notifications.hasBeenProcessed(jobId)) {
-      this.logger.debug(`Job ${jobId} already processed, skipping`);
-      await this.redis.xdel(REDIS_STREAMS.jobsDelivering, entry.id);
-      return;
-    }
-
-    const parsedPayload = (payload ? JSON.parse(payload) : {}) as JobPayload;
-
-    const chatIds = await this.findSubscribers(category, source);
-    if (chatIds.length === 0) {
-      this.logger.debug(
-        `Job ${jobId} (${category}/${source}) has no subscribers`,
+    // A payload that isn't a JSON object can never render into a
+    // meaningful message, and retrying won't change that — so it's dropped
+    // right here (deleted from jobs:delivering and, by returning normally,
+    // acked) rather than thrown, which would leave it on the PEL to fail
+    // again on every sweep until it's dead-lettered.
+    const parsedPayload = this.parsePayload(payload);
+    if (!parsedPayload) {
+      this.logger.warn(
+        `Dropping jobs:delivering entry ${entry.id} (job ${jobId}): payload is not a valid JSON object`,
       );
       await this.redis.xdel(REDIS_STREAMS.jobsDelivering, entry.id);
       return;
     }
 
-    // Persist who is supposed to receive this job before handing it off to
-    // the telegram-bot module, so a crash between here and the XADD below
-    // never loses the record of an intended delivery.
-    await this.notifications.insertPendingForChats(jobId, chatIds);
+    // Rows already recorded for this job mean an earlier attempt got at
+    // least as far as insertPendingForChats — but not necessarily as far
+    // as the notify:telegram XADD below (the process may have died in
+    // between). So existing rows alone are no longer a reason to skip:
+    //
+    // - Recipients still `pending` were never confirmed handed off, so the
+    //   job is re-handed off to exactly those. They're the recorded
+    //   original fan-out, deliberately *not* a fresh re-match: re-matching
+    //   now could pull in subscribers who joined after the job first
+    //   arrived and were never part of it, which isn't a faithful retry.
+    // - If no row is `pending` any more (all sent/failed/cancelled), the
+    //   job was fully handed off and fully resolved — skip, exactly like
+    //   the same-jobId redelivery idempotency in
+    //   docs/jobs-new-stream-contract.md promises.
+    //
+    // Re-handing off a job whose first notify:telegram entry did in fact
+    // go out (crash after the XADD but before the XDEL/ack here, or Python
+    // redelivering the same jobId while the first fan-out is still being
+    // sent) can't double-send either: TelegramDispatchService.deliverOne
+    // atomically SADDs each chatId into notif:delivered:{jobId} *before*
+    // sending and skips any chatId already in it. That holds even when
+    // the two notify:telegram entries for one job are processed at the
+    // same time by different senders — SADD is atomic, so for each
+    // recipient exactly one of them gets the 1 and sends, and the other
+    // gets 0 and skips. The only way the loser's skip could strand a
+    // recipient is if the winner's send then fails transiently — but in
+    // that case the winner SREMs the claim and throws, leaving *its*
+    // entry unacked for XCLAIM to retry, so the recipient is still
+    // covered.
+    const recorded = await this.findRecordedRecipients(jobId);
+    const isRetry = recorded.length > 0;
+    let chatIds: string[];
+
+    if (isRetry) {
+      chatIds = recorded
+        .filter((row) => row.status === 'pending')
+        .map((row) => row.chat_id);
+      if (chatIds.length === 0) {
+        this.logger.debug(`Job ${jobId} already fully processed, skipping`);
+        await this.redis.xdel(REDIS_STREAMS.jobsDelivering, entry.id);
+        return;
+      }
+      this.logger.log(
+        `Job ${jobId} was already partially processed — re-handing off to its ${chatIds.length} still-pending recipient(s)`,
+      );
+    } else {
+      chatIds = await this.findSubscribers(category, source);
+      if (chatIds.length === 0) {
+        this.logger.debug(
+          `Job ${jobId} (${category}/${source}) has no subscribers`,
+        );
+        await this.redis.xdel(REDIS_STREAMS.jobsDelivering, entry.id);
+        return;
+      }
+
+      // Persist who is supposed to receive this job before handing it off
+      // to the telegram-bot module, so a crash between here and the XADD
+      // below never loses the record of an intended delivery — a retry
+      // picks the recorded pending recipients back up (see above).
+      await this.notifications.insertPendingForChats(jobId, chatIds);
+    }
 
     const categoryName = await this.getCategoryName(category);
 
@@ -152,7 +218,7 @@ export class JobStreamService implements OnModuleInit, OnModuleDestroy {
           colorModule('CORE'),
           `job=${jobId}`,
           `${category}/${source}`,
-          `matched=${chatIds.length}`,
+          `${isRetry ? 'resumed' : 'matched'}=${chatIds.length}`,
           colorDuration(processingMs),
         ].join(' '),
       );
@@ -204,6 +270,99 @@ export class JobStreamService implements OnModuleInit, OnModuleDestroy {
     });
 
     return { jobId, category, source, payload };
+  }
+
+  /**
+   * The job's `payload` field decoded into an object, `{}` if it's absent
+   * or empty (the contract allows omitting it), or null if it's present
+   * but unusable — not valid JSON at all, or valid JSON that isn't an
+   * object (`"null"`, `"42"`, an array), any of which would otherwise
+   * throw further down when its fields are read.
+   */
+  private parsePayload(payload: string | undefined): JobPayload | null {
+    if (!payload) return {};
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(payload);
+    } catch {
+      return null;
+    }
+    if (
+      typeof parsed !== 'object' ||
+      parsed === null ||
+      Array.isArray(parsed)
+    ) {
+      return null;
+    }
+    return parsed as JobPayload;
+  }
+
+  /**
+   * Every notifications row already recorded for this job, with its
+   * status. Queried directly rather than through NotificationsService,
+   * since all this needs is a read of the recipients an earlier attempt
+   * recorded (see the retry handling in handleJob).
+   */
+  private async findRecordedRecipients(
+    jobId: string,
+  ): Promise<{ chat_id: string; status: string }[]> {
+    return this.dataSource.query(
+      `SELECT chat_id, status FROM notifications WHERE job_id = $1`,
+      [jobId],
+    );
+  }
+
+  /**
+   * Called by StreamConsumer right before it dead-letters a jobs:delivering
+   * entry that exhausted its delivery attempts. The consumer itself only
+   * copies the entry to jobs:delivering:dead and acks it — it never XDELs
+   * — which would leave a permanently-given-up entry sitting in
+   * jobs:delivering, a stream meant to hold only what's genuinely in
+   * flight. So it's deleted here.
+   *
+   * The callback is only handed the entry's fields, not its own id, so the
+   * entry is found by its `_originalId` (the jobs:notify id JobMoverService
+   * stamps on every entry it moves, unique per moved entry). That's a scan
+   * of jobs:delivering, but a cheap one: the stream only ever holds
+   * in-flight work, and this only runs for the rare entry that gives up
+   * for good. Notification rows the entry may already have inserted are
+   * deliberately left `pending`: replaying the dead-lettered entry into
+   * jobs:delivering later hands them off again via the normal retry path.
+   */
+  private async removeDeadLetteredEntry(
+    fields: Record<string, string>,
+  ): Promise<void> {
+    const originalId = fields._originalId;
+    if (!originalId) {
+      this.logger.warn(
+        `Dead-lettered jobs:delivering entry has no _originalId, so it can't be located to delete it from ${REDIS_STREAMS.jobsDelivering}`,
+      );
+      return;
+    }
+
+    const pageSize = 100;
+    let start = '-';
+    for (;;) {
+      const page = (await this.redis.xrange(
+        REDIS_STREAMS.jobsDelivering,
+        start,
+        '+',
+        'COUNT',
+        pageSize,
+      )) as [string, string[]][];
+
+      for (const [id, flat] of page) {
+        for (let i = 0; i < flat.length; i += 2) {
+          if (flat[i] === '_originalId' && flat[i + 1] === originalId) {
+            await this.redis.xdel(REDIS_STREAMS.jobsDelivering, id);
+            return;
+          }
+        }
+      }
+
+      if (page.length < pageSize) return;
+      start = `(${page[page.length - 1][0]}`;
+    }
   }
 
   /**
