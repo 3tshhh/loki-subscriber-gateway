@@ -334,7 +334,11 @@ export class StreamConsumer {
         this.options.deadLetterStream,
         '*',
         ...Object.entries(fields).flat(),
-        '_originalId',
+        // Not `_originalId`: entries moved by JobMoverService already carry
+        // that field (the jobs:notify id their arrival time is derived
+        // from), and a second field of the same name would shadow it on
+        // read-back, losing that arrival time if the entry is replayed.
+        '_deadLetteredFromId',
         id,
         '_reason',
         `exceeded ${this.options.maxDeliveryAttempts} delivery attempts`,

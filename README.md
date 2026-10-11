@@ -280,7 +280,7 @@ can't compile.
 - **Dead-lettering.** `jobs:delivering` and `notify:telegram` both cap
   retries at `MAX_DELIVERY_ATTEMPTS` (5). An entry delivered more often than
   that is copied to its dead-letter stream (`jobs:delivering:dead` /
-  `notify:telegram:dead`, with `_originalId`, `_reason`, `_deadLetteredAt`)
+  `notify:telegram:dead`, with `_deadLetteredFromId`, `_reason`, `_deadLetteredAt`)
   and acked, instead of cycling through claim/fail/reclaim forever. For
   `notify:telegram`, the entry's still-`pending` recipients are marked
   `failed` / `delivery_retries_exhausted`. For `jobs:delivering`, the entry

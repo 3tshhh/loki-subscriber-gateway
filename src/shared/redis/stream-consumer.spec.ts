@@ -160,7 +160,7 @@ describe('StreamConsumer', () => {
         '*',
         'jobId',
         'job-1-0',
-        '_originalId',
+        '_deadLetteredFromId',
         '1-0',
         '_reason',
         'exceeded 5 delivery attempts',
@@ -196,7 +196,13 @@ describe('StreamConsumer', () => {
       expect(redis.xadd).toHaveBeenCalledWith(
         DEAD,
         '*',
-        ...(['jobId', 'job-1-0', '_originalId', '1-0', '_reason'] as const),
+        ...([
+          'jobId',
+          'job-1-0',
+          '_deadLetteredFromId',
+          '1-0',
+          '_reason',
+        ] as const),
         expect.any(String),
         '_deadLetteredAt',
         expect.any(String),
