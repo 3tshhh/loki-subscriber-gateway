@@ -2,7 +2,9 @@ import {
   ConflictException,
   Inject,
   Injectable,
+  Logger,
   NotFoundException,
+  OnModuleInit,
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { DataSource, LessThanOrEqual, Repository } from 'typeorm';
@@ -20,6 +22,22 @@ import {
 
 /** Hard-delete deactivated users after this long, per retention policy. */
 export const RETENTION_DAYS = 30;
+
+/** How many chat_ids go into each SADD while rebuilding `users:active` —
+ * keeps any single command (and its argument list) bounded no matter how
+ * many active users there are. */
+const ACTIVE_USERS_REBUILD_CHUNK = 1000;
+
+/** Safety TTL on the temporary rebuild key, so a process that dies
+ * mid-rebuild doesn't leave a stray set behind forever. Cleared (PERSIST)
+ * in the same MULTI as the RENAME, so `users:active` itself never expires. */
+const ACTIVE_USERS_REBUILD_TTL_SECONDS = 60 * 60;
+
+/** How long startup waits for the rebuild before letting boot continue
+ * without it. The Redis client is configured with maxRetriesPerRequest:
+ * null, so with Redis down a command would otherwise wait indefinitely and
+ * hold up the whole application's startup with it. */
+const ACTIVE_USERS_REBUILD_STARTUP_TIMEOUT_MS = 15_000;
 
 export interface CategoryDto {
   id: string;
@@ -55,9 +73,19 @@ interface SnapshotRow {
  * {sourceId} / sub:{categoryId} Redis sets this service used to maintain
  * are gone. `users:active` is unrelated to matching (it's a delivery-time
  * liveness gate in telegram-dispatch.service.ts) and is still kept here.
+ *
+ * Postgres is the source of truth for who's active; `users:active` is a
+ * copy written separately from it (activate: DB then SADD; deactivate: SREM
+ * then DB), so the two can drift — a crash between the two steps, a Redis
+ * flush or restore, a path like updateSubscriptions that creates an active
+ * row without touching the set. Since dispatch silently skips anyone not
+ * in the set, drift means silently missed deliveries, so the set is rebuilt
+ * from Postgres on every startup (see rebuildActiveUsersSet).
  */
 @Injectable()
-export class SubscriberService {
+export class SubscriberService implements OnModuleInit {
+  private readonly logger = new Logger(SubscriberService.name);
+
   constructor(
     @InjectRepository(UserEntity)
     private readonly users: Repository<UserEntity>,
@@ -72,6 +100,112 @@ export class SubscriberService {
     private readonly dataSource: DataSource,
     @Inject(REDIS_CLIENT) private readonly redis: Redis,
   ) {}
+
+  /**
+   * Rebuilds `users:active` before anything that reads or writes it starts.
+   * Deliberately OnModuleInit (awaited), not OnApplicationBootstrap: Nest
+   * runs every module's onModuleInit — dependencies first, one module at a
+   * time — before any onApplicationBootstrap, and TelegramBotModule (which
+   * imports SubscriberModule, so its hooks run after this one's) starts
+   * long-polling and the notify:telegram consumer from its own
+   * onModuleInit. An OnApplicationBootstrap hook would therefore run with
+   * the bot already polling; this one finishes before the bot sees a single
+   * update, before dispatch consumes anything, and before the HTTP server
+   * is listening (app.listen() only happens after init).
+   *
+   * That closes the /start-or-/stop-during-rebuild race for this process.
+   * The residual window: a write from somewhere else — e.g. a previous
+   * instance still polling or serving HTTP during an overlapping deploy —
+   * landing between the SELECT and the RENAME is lost (an SADD overwritten,
+   * or an SREM undone if its Postgres write hadn't committed before the
+   * SELECT), until the next restart rebuilds again. The same window reopens
+   * if the rebuild exceeds ACTIVE_USERS_REBUILD_STARTUP_TIMEOUT_MS: boot
+   * carries on and the rebuild finishes in the background, still atomic,
+   * but now concurrent with live traffic.
+   */
+  async onModuleInit(): Promise<void> {
+    let timer: NodeJS.Timeout | undefined;
+    const timedOut = await Promise.race([
+      this.rebuildActiveUsersSet().then(() => false),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(
+          () => resolve(true),
+          ACTIVE_USERS_REBUILD_STARTUP_TIMEOUT_MS,
+        );
+      }),
+    ]);
+    clearTimeout(timer);
+    if (timedOut) {
+      this.logger.warn(
+        `users:active rebuild still running after ${ACTIVE_USERS_REBUILD_STARTUP_TIMEOUT_MS}ms — continuing startup, it will finish in the background`,
+      );
+    }
+  }
+
+  /**
+   * Replaces `users:active` with exactly the chat_ids Postgres has as
+   * active, atomically from dispatch's point of view: the new set is built
+   * under a temporary per-process key (SADD in chunks), then swapped in
+   * with a single RENAME — or `users:active` is DELeted outright if there
+   * are no active users, since RENAME can't move a key that was never
+   * created. Dispatch only ever sees the old set or the complete new one,
+   * never a half-built one.
+   *
+   * Never throws: a failure is logged and the existing set is left as it
+   * was (drifted, possibly, but no worse than before), so a Redis or
+   * Postgres hiccup can't take startup down with it. Returns the number of
+   * active users written, or null on failure.
+   */
+  async rebuildActiveUsersSet(): Promise<number | null> {
+    const tempKey = `${REDIS_KEYS.activeUsers}:rebuild:${process.pid}`;
+    try {
+      const rows: { chat_id: string }[] = await this.dataSource.query(
+        `SELECT chat_id FROM users WHERE active = true`,
+      );
+
+      // Anything left over under this key (a previous process with the same
+      // pid that died mid-rebuild) must not leak into the new set.
+      await this.redis.del(tempKey);
+      for (let i = 0; i < rows.length; i += ACTIVE_USERS_REBUILD_CHUNK) {
+        const chunk = rows
+          .slice(i, i + ACTIVE_USERS_REBUILD_CHUNK)
+          .map((row) => String(row.chat_id));
+        await this.redis.sadd(tempKey, ...chunk);
+        if (i === 0) {
+          await this.redis.expire(tempKey, ACTIVE_USERS_REBUILD_TTL_SECONDS);
+        }
+      }
+
+      if (rows.length > 0) {
+        // RENAME carries the temp key's safety TTL over with it, so PERSIST
+        // in the same MULTI — otherwise users:active itself would expire.
+        const results = await this.redis
+          .multi()
+          .rename(tempKey, REDIS_KEYS.activeUsers)
+          .persist(REDIS_KEYS.activeUsers)
+          .exec();
+        const failed = results?.find(([err]) => err);
+        if (!results || failed) {
+          throw failed?.[0] ?? new Error('MULTI was aborted');
+        }
+      } else {
+        await this.redis.del(REDIS_KEYS.activeUsers);
+      }
+
+      this.logger.log(
+        `Rebuilt users:active from Postgres: ${rows.length} active user(s)`,
+      );
+      return rows.length;
+    } catch (err) {
+      const error = err instanceof Error ? err : new Error(String(err));
+      this.logger.error(
+        `Failed to rebuild users:active from Postgres — leaving the existing set as-is: ${error.message}`,
+        error.stack,
+      );
+      await this.redis.del(tempKey).catch(() => undefined);
+      return null;
+    }
+  }
 
   /**
    * Idempotent row creation only — never reactivates an existing user.
@@ -259,7 +393,8 @@ export class SubscriberService {
    * so a deactivated user editing their picks stays deactivated until /start
    * or "Resume". Note this path doesn't SADD to `users:active`, so a
    * brand-new user created here is only picked up by dispatch once /start
-   * or "Resume" adds them to the set.
+   * or "Resume" adds them to the set, or the next startup's
+   * rebuildActiveUsersSet does.
    *
    * `username` follows the same COALESCE rule as activateUserUpsert: a
    * caller with no username never wipes a stored one (at the cost of a
