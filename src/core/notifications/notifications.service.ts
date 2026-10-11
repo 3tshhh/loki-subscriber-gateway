@@ -24,11 +24,28 @@ export type NotificationStatusChange =
       responseTimeMs: number;
     };
 
+/** A NotificationStatusChange that closes a row without it being sent. */
+export type NotificationCloseChange = Extract<
+  NotificationStatusChange,
+  { status: 'failed' | 'cancelled' }
+>;
+
 /** The columns every status write must set, all non-nullable. */
 type StatusColumns = Pick<
   NotificationEntity,
   'status' | 'statusChangedAt' | 'reason' | 'responseTimeMs'
 >;
+
+/** The full set of status columns for one row's change, stamped now. */
+function toStatusColumns(change: NotificationStatusChange): StatusColumns {
+  return {
+    status: change.status,
+    statusChangedAt: new Date(),
+    reason:
+      change.status === 'sent' ? NotificationReason.DELIVERED : change.reason,
+    responseTimeMs: toResponseTimeMs(change.responseTimeMs),
+  };
+}
 
 /**
  * Applies the SET clause for bulk-closing still-`pending` rows as `failed`/
@@ -121,14 +138,29 @@ export class NotificationsService {
     chatId: string,
     change: NotificationStatusChange,
   ): Promise<void> {
-    const columns: StatusColumns = {
-      status: change.status,
-      statusChangedAt: new Date(),
-      reason:
-        change.status === 'sent' ? NotificationReason.DELIVERED : change.reason,
-      responseTimeMs: toResponseTimeMs(change.responseTimeMs),
-    };
-    await this.notifications.update({ jobId, chatId }, columns);
+    await this.notifications.update({ jobId, chatId }, toStatusColumns(change));
+  }
+
+  /**
+   * Like setStatus, but for closing a single row as `failed`/`cancelled`
+   * only if it's still `pending` — the per-row counterpart of
+   * closePendingNotifications, for a caller that knows the job's own
+   * arrival time and so computes response_time_ms itself (arrival→now),
+   * exactly as setStatus's callers do. A row that has already moved on
+   * (sent by an earlier attempt, or cancelled by /stop with its own, more
+   * specific reason) is left as it is. Resolves to whether a row was
+   * actually closed.
+   */
+  async closeIfPending(
+    jobId: string,
+    chatId: string,
+    change: NotificationCloseChange,
+  ): Promise<boolean> {
+    const result = await this.notifications.update(
+      { jobId, chatId, status: 'pending' },
+      toStatusColumns(change),
+    );
+    return (result.affected ?? 0) > 0;
   }
 
   /**

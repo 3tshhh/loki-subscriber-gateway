@@ -210,6 +210,47 @@ describe('NotificationsService', () => {
     });
   });
 
+  describe('closeIfPending', () => {
+    it('closes the row only while it is still pending, filling every status column', async () => {
+      await expect(
+        service.closeIfPending('job-1', '111', {
+          status: 'cancelled',
+          reason: NotificationReason.RECIPIENT_INACTIVE,
+          responseTimeMs: 1200,
+        }),
+      ).resolves.toBe(true);
+
+      const [criteria, columns] = repo.update.mock.calls[0] as [
+        unknown,
+        Record<string, unknown>,
+      ];
+      expect(criteria).toEqual({
+        jobId: 'job-1',
+        chatId: '111',
+        status: 'pending',
+      });
+      expectAllStatusColumnsFilled(columns);
+      expect(columns).toEqual({
+        status: 'cancelled',
+        statusChangedAt: new Date(NOW),
+        reason: NotificationReason.RECIPIENT_INACTIVE,
+        responseTimeMs: 1200,
+      });
+    });
+
+    it('resolves false when the row had already left pending', async () => {
+      repo.update.mockResolvedValue({ affected: 0 });
+
+      await expect(
+        service.closeIfPending('job-1', '111', {
+          status: 'cancelled',
+          reason: NotificationReason.RECIPIENT_INACTIVE,
+          responseTimeMs: 1200,
+        }),
+      ).resolves.toBe(false);
+    });
+  });
+
   describe('markDeliveryRetriesExhausted', () => {
     it('closes only still-pending rows as failed with every status column filled', async () => {
       await service.markDeliveryRetriesExhausted('job-1', ['111', '222']);

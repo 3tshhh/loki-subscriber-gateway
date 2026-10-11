@@ -159,9 +159,7 @@ export class TelegramDispatchService implements OnModuleInit, OnModuleDestroy {
       chatId,
     );
     if (!stillActive) {
-      this.logger.debug(
-        `Skipping job ${jobId} for chat ${chatId}: no longer an active subscriber`,
-      );
+      await this.cancelForInactiveRecipient(job, chatId);
       return;
     }
 
@@ -242,6 +240,63 @@ export class TelegramDispatchService implements OnModuleInit, OnModuleDestroy {
       responseTimeMs: endToEndMs,
     });
     this.logDelivery(job, chatId, true, endToEndMs);
+  }
+
+  /**
+   * A recipient missing from users:active is never sent to, but their row
+   * mustn't be left `pending` forever either — it's closed as `cancelled` /
+   * RECIPIENT_INACTIVE, with response_time_ms = arrival→now like every
+   * other single-row close here (the 403 path's `failed` write).
+   *
+   * The chat is also claimed in the delivered set first, exactly like a
+   * recipient whose send is permanently given up on (403). A cancelled row
+   * means "this job was never sent to them, and won't be": job-level
+   * resume only re-hands off `pending` rows, and /stop's own cancellations
+   * likewise aren't resent after a resubscribe (no burst of stale jobs).
+   * Without the claim, an XCLAIM retry of this same notify:telegram entry
+   * (another recipient in it failed transiently) landing after the user
+   * reactivated would send after all and flip the row from `cancelled` to
+   * `sent` — the claim makes that retry skip them, so the outcome is the
+   * same whichever path sees the job next.
+   *
+   * Claim first, close second: a claim that was already taken (0) means an
+   * earlier attempt already resolved this recipient (e.g. sent before they
+   * deactivated), so nothing is written. If closing the row then fails, the
+   * claim is released and the error rethrown as transient — the entry stays
+   * unacked and a retry closes the row properly, instead of the claim making
+   * every retry skip a row that's still `pending`. closeIfPending only
+   * touches a still-`pending` row, so a row /stop already cancelled keeps
+   * its more specific user_unsubscribed/bot_blocked reason.
+   */
+  private async cancelForInactiveRecipient(
+    job: NotifyTelegramFields,
+    chatId: string,
+  ): Promise<void> {
+    const { jobId } = job;
+    const claimed = await this.claimDelivery(jobId, chatId);
+    if (!claimed) {
+      this.logger.debug(
+        `Skipping job ${jobId} for chat ${chatId}: no longer an active subscriber, already handled in a previous attempt`,
+      );
+      return;
+    }
+
+    this.logger.debug(
+      `Cancelling job ${jobId} for chat ${chatId}: no longer an active subscriber`,
+    );
+    try {
+      await this.notifications.closeIfPending(jobId, chatId, {
+        status: 'cancelled',
+        reason: NotificationReason.RECIPIENT_INACTIVE,
+        responseTimeMs: Date.now() - job.enqueuedAtMs,
+      });
+    } catch (err) {
+      this.logger.error(
+        `Failed to cancel job ${jobId} for inactive chat ${chatId}: ${(err as Error).message}`,
+      );
+      await this.redis.srem(REDIS_KEYS.deliveredForJob(jobId), chatId);
+      throw new TransientDeliveryError((err as Error).message);
+    }
   }
 
   /**

@@ -197,15 +197,15 @@ Redis is used for stream transport and a couple of delivery-time
 mechanisms — **not** for subscriber matching. Exact names live in
 `src/shared/redis/redis.constants.ts`.
 
-| Key                       | Purpose                                                                                                                                                           |
-| ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `jobs:notify`             | Inbound stream from the Python producer (`dispatch-group`)                                                                                                        |
-| `jobs:delivering`         | Internal stream of jobs being matched/handed off (`delivering-group`)                                                                                             |
-| `jobs:delivering:dead`    | Dead-letter stream for `jobs:delivering` entries that exceeded `MAX_DELIVERY_ATTEMPTS`                                                                            |
-| `notify:telegram`         | Internal stream of per-job send batches (`telegram-senders`)                                                                                                      |
-| `notify:telegram:dead`    | Dead-letter stream for `notify:telegram` entries that exceeded `MAX_DELIVERY_ATTEMPTS`                                                                            |
-| `users:active`            | Set of every currently-active chat_id; dispatch checks it before sending, closing the race where a user stops right after their job was queued (see below)        |
-| `notif:delivered:{jobId}` | Per-job set of chat_ids already claimed (sent, being sent, or permanently failed); guards retried/duplicated `notify:telegram` entries from re-sending. 7-day TTL |
+| Key                       | Purpose                                                                                                                                                                                  |
+| ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `jobs:notify`             | Inbound stream from the Python producer (`dispatch-group`)                                                                                                                               |
+| `jobs:delivering`         | Internal stream of jobs being matched/handed off (`delivering-group`)                                                                                                                    |
+| `jobs:delivering:dead`    | Dead-letter stream for `jobs:delivering` entries that exceeded `MAX_DELIVERY_ATTEMPTS`                                                                                                   |
+| `notify:telegram`         | Internal stream of per-job send batches (`telegram-senders`)                                                                                                                             |
+| `notify:telegram:dead`    | Dead-letter stream for `notify:telegram` entries that exceeded `MAX_DELIVERY_ATTEMPTS`                                                                                                   |
+| `users:active`            | Set of every currently-active chat_id; dispatch checks it before sending, closing the race where a user stops right after their job was queued (see below)                               |
+| `notif:delivered:{jobId}` | Per-job set of chat_ids already claimed (sent, being sent, permanently failed, or cancelled as inactive); guards retried/duplicated `notify:telegram` entries from re-sending. 7-day TTL |
 
 ### `users:active`
 
@@ -239,8 +239,8 @@ Residual windows, accepted at this scale:
 - A crash between the Postgres write and the Redis write of an
   activate/deactivate leaves the two disagreeing until the next restart. On
   the deactivate side that means a user still active in Postgres but missing
-  from the set: they keep getting matched, dispatch skips them, and their
-  rows stay `pending`.
+  from the set: they keep getting matched, and dispatch skips them, closing
+  each such row as `cancelled` / `recipient_inactive`.
 
 ## Notifications table
 
@@ -249,12 +249,12 @@ One row per `(job_id, chat_id)`. Every column is always filled — the
 and `response_time_ms` `NOT NULL`, and the write paths are typed so a NULL
 can't compile.
 
-| `status`    | `status_changed_at`             | `reason`                                                                                                            | `response_time_ms`         |
-| ----------- | ------------------------------- | ------------------------------------------------------------------------------------------------------------------- | -------------------------- |
-| `pending`   | insert time                     | `awaiting_delivery`                                                                                                 | job arrival → insert       |
-| `sent`      | when Telegram accepted the send | `delivered`                                                                                                         | job arrival → send         |
-| `failed`    | when the failure was detected   | `bot_blocked` (Telegram 403) or `delivery_retries_exhausted` (`notify:telegram` entry dead-lettered)                | job arrival → failure      |
-| `cancelled` | when the row was cancelled      | `user_unsubscribed` (`/stop`) or `bot_blocked` (the chat's other pending rows, cancelled when a 403 deactivates it) | job arrival → cancellation |
+| `status`    | `status_changed_at`             | `reason`                                                                                                                                               | `response_time_ms`         |
+| ----------- | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------- |
+| `pending`   | insert time                     | `awaiting_delivery`                                                                                                                                    | job arrival → insert       |
+| `sent`      | when Telegram accepted the send | `delivered`                                                                                                                                            | job arrival → send         |
+| `failed`    | when the failure was detected   | `bot_blocked` (Telegram 403) or `delivery_retries_exhausted` (`notify:telegram` entry dead-lettered)                                                   | job arrival → failure      |
+| `cancelled` | when the row was cancelled      | `user_unsubscribed` (`/stop`), `bot_blocked` (the chat's other pending rows, cancelled when a 403 deactivates it), or `recipient_inactive` (see below) | job arrival → cancellation |
 
 - **`sent_at` was renamed to `status_changed_at`** and now changes on every
   status transition, not only on `sent`. Anyone with external SQL, views, or
@@ -266,6 +266,13 @@ can't compile.
   `status_changed_at − created_at` (the true arrival time was never stored),
   so treat legacy latencies as lower bounds.
 - `response_time_ms` is a Postgres `INTEGER`, clamped to `[0, 2147483647]`.
+- **`recipient_inactive`**: when dispatch comes to send and the chat is no
+  longer in `users:active`, nothing is sent and the row — only if it's still
+  `pending`, so `/stop`'s own `user_unsubscribed` is kept — is closed as
+  `cancelled`. The chat is also claimed in `notif:delivered:{jobId}`, so a
+  retry of the same `notify:telegram` entry won't send it either if they
+  reactivate in the meantime: like `/stop`'s cancellations, a cancelled row
+  is final for that job, and job-level resume only picks up `pending` rows.
 
 ## Reliability notes
 

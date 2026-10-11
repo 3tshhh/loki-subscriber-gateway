@@ -9,7 +9,8 @@ import { MigrationInterface, QueryRunner } from 'typeorm';
  *   `sent`/`failed`/`cancelled`), instead of only ever being set for `sent`.
  * - `reason` is set for every status: `pending` rows get
  *   'awaiting_delivery' and `sent` rows 'delivered', alongside the existing
- *   outcome reasons. `failed`/`cancelled` rows from before the `reason`
+ *   outcome reasons plus the new 'recipient_inactive' (a row dispatch
+ *   cancels because its recipient is no longer in users:active). `failed`/`cancelled` rows from before the `reason`
  *   column existed (AddNotificationReasonAndCreatedAtColumns) have no
  *   recorded cause, so they're backfilled with 'unknown_legacy' rather than
  *   a guessed one.
@@ -61,7 +62,7 @@ export class FillAllNotificationColumns1789800000000 implements MigrationInterfa
     `);
     await queryRunner.query(`
       ALTER TABLE "notifications" ADD CONSTRAINT "notifications_reason_check"
-      CHECK ("reason" IN ('awaiting_delivery', 'delivered', 'bot_blocked', 'user_unsubscribed', 'delivery_retries_exhausted', 'unknown_legacy'))
+      CHECK ("reason" IN ('awaiting_delivery', 'delivered', 'bot_blocked', 'user_unsubscribed', 'recipient_inactive', 'delivery_retries_exhausted', 'unknown_legacy'))
     `);
     await queryRunner.query(`
       UPDATE "notifications"
@@ -91,8 +92,10 @@ export class FillAllNotificationColumns1789800000000 implements MigrationInterfa
 
   /**
    * Restores the pre-migration shape and semantics: the synthetic reasons
-   * go back to NULL, response_time_ms/sent_at go back to NULL for anything
-   * not `sent`. Backfilled response_time_ms values on legacy `sent` rows
+   * go back to NULL, and so do the outcome reasons this migration
+   * introduced (the old CHECK doesn't allow them, and before it a
+   * `failed`/`cancelled` row with no recorded cause was simply NULL);
+   * response_time_ms/sent_at go back to NULL for anything not `sent`. Backfilled response_time_ms values on legacy `sent` rows
    * can't be told apart from real ones, so those are kept.
    */
   public async down(queryRunner: QueryRunner): Promise<void> {
@@ -105,7 +108,7 @@ export class FillAllNotificationColumns1789800000000 implements MigrationInterfa
 
     await queryRunner.query(`
       UPDATE "notifications" SET "reason" = NULL
-      WHERE "reason" IN ('awaiting_delivery', 'delivered', 'unknown_legacy')
+      WHERE "reason" IN ('awaiting_delivery', 'delivered', 'recipient_inactive', 'unknown_legacy')
     `);
     await queryRunner.query(
       `ALTER TABLE "notifications" DROP CONSTRAINT "notifications_reason_check"`,

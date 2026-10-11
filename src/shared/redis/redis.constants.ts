@@ -4,7 +4,8 @@ export const REDIS_KEYS = {
   /** Set of every currently-active chat_id, checked by dispatch before sending. */
   activeUsers: 'users:active',
   /**
-   * Per-job set of chat_ids already handled (sent, or permanently failed).
+   * Per-job set of chat_ids already handled (sent, permanently failed, or
+   * cancelled because they were no longer in users:active).
    * Guards against re-delivering to the same recipient when a notify:telegram
    * entry is retried after an XCLAIM. TTL'd so it doesn't accumulate forever.
    */

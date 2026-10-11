@@ -13,9 +13,10 @@ export type NotificationStatus = 'pending' | 'sent' | 'failed' | 'cancelled';
 /**
  * Why a row is in its current status — every row carries one, whatever its
  * status, so the column is never NULL. The outcome reasons (bot_blocked,
- * user_unsubscribed, delivery_retries_exhausted) are set at the exact point
- * each `failed`/`cancelled` outcome is detected, never inferred after the
- * fact; `pending`/`sent` rows get their status's own fixed reason.
+ * user_unsubscribed, recipient_inactive, delivery_retries_exhausted) are
+ * set at the exact point each `failed`/`cancelled` outcome is detected,
+ * never inferred after the fact; `pending`/`sent` rows get their status's
+ * own fixed reason.
  */
 export enum NotificationReason {
   /** The row's `pending` reason: matched and persisted, handed off to the
@@ -29,6 +30,14 @@ export enum NotificationReason {
   BOT_BLOCKED = 'bot_blocked',
   /** The recipient ran /stop — cancels their still-pending rows. */
   USER_UNSUBSCRIBED = 'user_unsubscribed',
+  /** Dispatch found the recipient missing from users:active when it came
+   * to send — e.g. a row inserted from a match against a user who was
+   * deactivated in between, or Postgres and users:active having drifted
+   * apart (see the README's users:active section). Nothing was sent, and
+   * the row is `cancelled` rather than left `pending` forever. Only ever
+   * written onto a row that's still `pending`, so a more specific reason
+   * already recorded (user_unsubscribed, bot_blocked) is kept. */
+  RECIPIENT_INACTIVE = 'recipient_inactive',
   /** Exhausted MAX_DELIVERY_ATTEMPTS XCLAIM retries and was moved to the
    * dead-letter stream without ever successfully sending. */
   DELIVERY_RETRIES_EXHAUSTED = 'delivery_retries_exhausted',
@@ -48,6 +57,7 @@ export enum NotificationReason {
 export type NotificationOutcomeReason =
   | NotificationReason.BOT_BLOCKED
   | NotificationReason.USER_UNSUBSCRIBED
+  | NotificationReason.RECIPIENT_INACTIVE
   | NotificationReason.DELIVERY_RETRIES_EXHAUSTED;
 
 /** Every NotificationOutcomeReason value, for runtime validation (DTOs). */
@@ -55,6 +65,7 @@ export const NOTIFICATION_OUTCOME_REASONS: readonly NotificationOutcomeReason[] 
   [
     NotificationReason.BOT_BLOCKED,
     NotificationReason.USER_UNSUBSCRIBED,
+    NotificationReason.RECIPIENT_INACTIVE,
     NotificationReason.DELIVERY_RETRIES_EXHAUSTED,
   ];
 

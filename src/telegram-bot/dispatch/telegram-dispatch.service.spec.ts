@@ -74,6 +74,7 @@ describe('TelegramDispatchService', () => {
   let subscriber: { deactivateUser: jest.Mock };
   let notifications: {
     setStatus: jest.Mock;
+    closeIfPending: jest.Mock;
     markDeliveryRetriesExhausted: jest.Mock;
   };
   let service: TelegramDispatchService;
@@ -103,6 +104,7 @@ describe('TelegramDispatchService', () => {
     subscriber = { deactivateUser: jest.fn().mockResolvedValue(true) };
     notifications = {
       setStatus: jest.fn().mockResolvedValue(undefined),
+      closeIfPending: jest.fn().mockResolvedValue(true),
       markDeliveryRetriesExhausted: jest.fn().mockResolvedValue(undefined),
     };
     const config = {
@@ -189,18 +191,61 @@ describe('TelegramDispatchService', () => {
       expect(text).toContain('https://broken-link-fragm');
     });
 
-    it('skips a recipient that is no longer in users:active', async () => {
+    it('cancels the still-pending row of a recipient no longer in users:active, claiming them so a retry skips them', async () => {
       redis.sismember.mockResolvedValue(0);
 
-      await deliverOne();
+      await expect(deliverOne()).resolves.toBeUndefined();
 
       expect(redis.sismember).toHaveBeenCalledWith(
         REDIS_KEYS.activeUsers,
         CHAT_ID,
       );
-      expect(redis.pipeline).not.toHaveBeenCalled();
+      expect(pipeline.sadd).toHaveBeenCalledWith(
+        REDIS_KEYS.deliveredForJob(JOB_ID),
+        CHAT_ID,
+      );
+      expect(notifications.closeIfPending).toHaveBeenCalledWith(
+        JOB_ID,
+        CHAT_ID,
+        {
+          status: 'cancelled',
+          reason: NotificationReason.RECIPIENT_INACTIVE,
+          responseTimeMs: 1500,
+        },
+      );
+      expect(pipeline.sadd.mock.invocationCallOrder[0]).toBeLessThan(
+        notifications.closeIfPending.mock.invocationCallOrder[0],
+      );
       expect(sendMessage).not.toHaveBeenCalled();
       expect(notifications.setStatus).not.toHaveBeenCalled();
+      expect(redis.srem).not.toHaveBeenCalled();
+    });
+
+    it('writes nothing for an inactive recipient an earlier attempt already handled', async () => {
+      redis.sismember.mockResolvedValue(0);
+      pipeline.exec.mockResolvedValue([
+        [null, 0],
+        [null, 1],
+      ]);
+
+      await expect(deliverOne()).resolves.toBeUndefined();
+
+      expect(notifications.closeIfPending).not.toHaveBeenCalled();
+      expect(sendMessage).not.toHaveBeenCalled();
+    });
+
+    it('releases the claim and fails transiently if cancelling an inactive recipient fails', async () => {
+      redis.sismember.mockResolvedValue(0);
+      notifications.closeIfPending.mockRejectedValue(new Error('db down'));
+
+      const error = (await deliverOne().catch((err: unknown) => err)) as Error;
+
+      expect(error.constructor.name).toBe('TransientDeliveryError');
+      expect(redis.srem).toHaveBeenCalledWith(
+        REDIS_KEYS.deliveredForJob(JOB_ID),
+        CHAT_ID,
+      );
+      expect(sendMessage).not.toHaveBeenCalled();
     });
 
     it('skips a recipient already in the delivered set for this job', async () => {
