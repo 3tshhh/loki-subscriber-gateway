@@ -21,6 +21,34 @@ import {
 /** Hard-delete deactivated users after this long, per retention policy. */
 export const RETENTION_DAYS = 30;
 
+export interface CategoryDto {
+  id: string;
+  name: string;
+  enabled: boolean;
+}
+
+export interface SourceDto {
+  id: string;
+  name: string;
+  enabled: boolean;
+}
+
+export interface BootstrapSnapshot {
+  active: boolean;
+  categoryIds: string[];
+  sourceIds: string[];
+  categories: CategoryDto[];
+  sources: SourceDto[];
+}
+
+interface SnapshotRow {
+  kind: 'category' | 'source';
+  id: string;
+  name: string;
+  selected: boolean;
+  active: boolean | null;
+}
+
 /**
  * Subscriber matching is a direct Postgres query now (see
  * job-stream.service.ts's findSubscribers) — the sub:{categoryId}:
@@ -77,41 +105,90 @@ export class SubscriberService {
   }
 
   /**
-   * Everything a bot command needs to render its first screen, in one call:
-   * ensures the row exists, optionally activates (true for /start, false
-   * for /categories, /sources), and returns current state + both enabled
-   * lists together.
+   * The one write /start makes (and the "Resume" button) — an upsert in a
+   * single statement, no prior read needed: creates the row on a genuinely
+   * first-ever activation, or reactivates an existing one either way.
+   */
+  async activateUserUpsert(
+    chatId: string,
+    username?: string | null,
+  ): Promise<void> {
+    await this.dataSource.query(
+      `INSERT INTO users (chat_id, active, deactivated_at, username)
+       VALUES ($1, true, NULL, $2)
+       ON CONFLICT (chat_id) DO UPDATE SET active = true, deactivated_at = NULL, username = EXCLUDED.username`,
+      [chatId, username ?? null],
+    );
+    await this.redis.sadd(REDIS_KEYS.activeUsers, chatId);
+  }
+
+  /**
+   * Everything /start, /categories, /sources need to render their first
+   * screen, in exactly one SELECT (a CTE for this chat's active state,
+   * UNION ALL'd across categories and sources, each LEFT JOINed against
+   * this chat's picks). Works identically whether or not chat_id has a
+   * users row yet — a brand new chat just comes back with active=false and
+   * every selected flag false — and this method never writes anything.
+   */
+  async getBootstrapSnapshot(chatId: string): Promise<BootstrapSnapshot> {
+    const rows: SnapshotRow[] = await this.dataSource.query(
+      `WITH target_user AS (
+         SELECT active FROM users WHERE chat_id = $1
+       )
+       SELECT 'category' AS kind, c.id, c.name,
+              (uc.chat_id IS NOT NULL) AS selected, u.active
+       FROM categories c
+       LEFT JOIN user_categories uc ON uc.category_id = c.id AND uc.chat_id = $1
+       LEFT JOIN target_user u ON true
+       WHERE c.enabled = true
+
+       UNION ALL
+
+       SELECT 'source' AS kind, s.id, s.name,
+              (us.chat_id IS NOT NULL) AS selected, u.active
+       FROM sources s
+       LEFT JOIN user_sources us ON us.source_id = s.id AND us.chat_id = $1
+       LEFT JOIN target_user u ON true
+       WHERE s.enabled = true
+
+       ORDER BY kind, name`,
+      [chatId],
+    );
+
+    const categories: CategoryDto[] = [];
+    const sources: SourceDto[] = [];
+    const categoryIds: string[] = [];
+    const sourceIds: string[] = [];
+    let active = false;
+
+    for (const row of rows) {
+      active = Boolean(row.active);
+      if (row.kind === 'category') {
+        categories.push({ id: row.id, name: row.name, enabled: true });
+        if (row.selected) categoryIds.push(row.id);
+      } else {
+        sources.push({ id: row.id, name: row.name, enabled: true });
+        if (row.selected) sourceIds.push(row.id);
+      }
+    }
+
+    return { active, categoryIds, sourceIds, categories, sources };
+  }
+
+  /**
+   * Composes the two calls above into the one synchronous request/response
+   * an HTTP caller expects: optionally activate, then return the snapshot.
+   * (/start passes activate:true; /categories, /sources pass false.)
    */
   async bootstrap(
     chatId: string,
     activate: boolean,
-  ): Promise<{
-    active: boolean;
-    categoryIds: string[];
-    sourceIds: string[];
-    categories: CategoryEntity[];
-    sources: SourceEntity[];
-  }> {
-    let user = await this.ensureUser(chatId);
+    username?: string | null,
+  ): Promise<BootstrapSnapshot> {
     if (activate) {
-      await this.activateUser(chatId);
-      user = { ...user, active: true, deactivatedAt: null };
+      await this.activateUserUpsert(chatId, username);
     }
-
-    const [categoryRows, sourceRows, categories, sources] = await Promise.all([
-      this.userCategories.find({ where: { chatId: user.chatId } }),
-      this.userSources.find({ where: { chatId: user.chatId } }),
-      this.getEnabledCategories(),
-      this.getEnabledSources(),
-    ]);
-
-    return {
-      active: user.active,
-      categoryIds: categoryRows.map((r) => r.categoryId),
-      sourceIds: sourceRows.map((r) => r.sourceId),
-      categories,
-      sources,
-    };
+    return this.getBootstrapSnapshot(chatId);
   }
 
   async getEnabledCategories(): Promise<CategoryEntity[]> {
@@ -158,38 +235,44 @@ export class SubscriberService {
   }
 
   /**
-   * Replaces the user's category/source selection in Postgres. Picking
-   * zero sources means "any source" for each picked category (mirrors the
-   * pre-split bot's picker: "If you select none, you'll receive jobs from
-   * all sources") — job-stream.service.ts's matching query treats a user
-   * with no user_sources rows exactly this way.
+   * Replaces the user's category/source selection in Postgres. Upserts the
+   * user row first so this works even for a chat whose only interaction so
+   * far was /categories or /sources (never /start) — those are pure reads
+   * and never create the row themselves. Picking zero sources means "any
+   * source" for each picked category (mirrors the pre-split bot's picker:
+   * "If you select none, you'll receive jobs from all sources") —
+   * job-stream.service.ts's matching query treats a user with no
+   * user_sources rows exactly this way.
    */
   async updateSubscriptions(
     chatId: string,
     categoryIds: string[],
     sourceIds: string[],
-  ): Promise<void> {
-    const user = await this.getUserOrThrow(chatId);
-
+    username?: string | null,
+  ): Promise<{ categoryIds: string[]; sourceIds: string[] }> {
     await this.dataSource.transaction(async (manager) => {
-      await manager.delete(UserCategoryEntity, { chatId: user.chatId });
-      await manager.delete(UserSourceEntity, { chatId: user.chatId });
+      await manager.query(
+        `INSERT INTO users (chat_id, active, username) VALUES ($1, true, $2)
+         ON CONFLICT (chat_id) DO UPDATE SET username = EXCLUDED.username`,
+        [chatId, username ?? null],
+      );
+      await manager.delete(UserCategoryEntity, { chatId });
+      await manager.delete(UserSourceEntity, { chatId });
       if (categoryIds.length > 0) {
         await manager.insert(
           UserCategoryEntity,
-          categoryIds.map((categoryId) => ({
-            chatId: user.chatId,
-            categoryId,
-          })),
+          categoryIds.map((categoryId) => ({ chatId, categoryId })),
         );
       }
       if (sourceIds.length > 0) {
         await manager.insert(
           UserSourceEntity,
-          sourceIds.map((sourceId) => ({ chatId: user.chatId, sourceId })),
+          sourceIds.map((sourceId) => ({ chatId, sourceId })),
         );
       }
     });
+
+    return { categoryIds, sourceIds };
   }
 
   /**
@@ -200,25 +283,33 @@ export class SubscriberService {
    * cancels any of their notifications still sitting pending so a later
    * resubscribe doesn't trigger a burst of stale jobs. Hard deletion only
    * happens via the retention sweep.
+   *
+   * Tolerant of a chat_id that was never actually a subscriber — /stop must
+   * be safe to send even for a chat with no users row, so this returns
+   * `false` instead of throwing; callers that need 404 semantics (the HTTP
+   * surface) check the return value themselves rather than relying on an
+   * exception, so a bot caller can just ignore it.
    */
   async deactivateUser(
     chatId: string,
     reason: NotificationReason = NotificationReason.USER_UNSUBSCRIBED,
-  ): Promise<void> {
-    const user = await this.getUserOrThrow(chatId);
+  ): Promise<boolean> {
     await this.redis.srem(REDIS_KEYS.activeUsers, chatId);
 
-    await this.dataSource.transaction(async (manager) => {
-      await manager.update(
+    return this.dataSource.transaction(async (manager) => {
+      const result = await manager.update(
         UserEntity,
-        { chatId: user.chatId },
+        { chatId },
         { active: false, deactivatedAt: new Date() },
       );
+      if (!result.affected) return false; // never existed — nothing to cancel either
+
       await manager.update(
         NotificationEntity,
-        { chatId: user.chatId, status: 'pending' },
+        { chatId, status: 'pending' },
         { status: 'cancelled', reason },
       );
+      return true;
     });
   }
 

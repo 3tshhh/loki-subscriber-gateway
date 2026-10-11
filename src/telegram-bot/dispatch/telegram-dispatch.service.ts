@@ -21,7 +21,8 @@ import {
   StreamEntry,
 } from '../../shared/redis';
 import { BOT } from '../bot.provider';
-import { BotSubscriberService } from '../bot-subscriber.service';
+import { SubscriberService } from '../../core/subscriber/subscriber.service';
+import { NotificationsService } from '../../core/notifications/notifications.service';
 import { NotificationReason } from '../../core/notifications/entities/notification.entity';
 import { buildJobMessage, safeButtonUrl } from './message-builder';
 import {
@@ -68,7 +69,8 @@ export class TelegramDispatchService implements OnModuleInit, OnModuleDestroy {
   constructor(
     @Inject(REDIS_CLIENT) private readonly redis: Redis,
     @Inject(BOT) private readonly bot: Bot,
-    private readonly botData: BotSubscriberService,
+    private readonly subscriber: SubscriberService,
+    private readonly notifications: NotificationsService,
     config: ConfigService,
   ) {
     this.shortUrlDomain = config.get<string>('SHORT_URL_DOMAIN');
@@ -207,7 +209,7 @@ export class TelegramDispatchService implements OnModuleInit, OnModuleDestroy {
           'failed',
           NotificationReason.BOT_BLOCKED,
         );
-        await this.botData.deactivateUser(
+        await this.subscriber.deactivateUser(
           chatId,
           NotificationReason.BOT_BLOCKED,
         );
@@ -326,7 +328,7 @@ export class TelegramDispatchService implements OnModuleInit, OnModuleDestroy {
     responseTimeMs: number | null = null,
   ): Promise<void> {
     try {
-      await this.botData.setNotificationStatus(
+      await this.notifications.setStatus(
         jobId,
         chatId,
         status,
@@ -354,7 +356,7 @@ export class TelegramDispatchService implements OnModuleInit, OnModuleDestroy {
     if (!jobId || !chatIds) return;
     try {
       const recipients = JSON.parse(chatIds) as string[];
-      await this.botData.markDeliveryRetriesExhausted(jobId, recipients);
+      await this.notifications.markDeliveryRetriesExhausted(jobId, recipients);
     } catch (err) {
       this.logger.error(
         `Failed to mark delivery-retries-exhausted for job ${jobId}: ${(err as Error).message}`,

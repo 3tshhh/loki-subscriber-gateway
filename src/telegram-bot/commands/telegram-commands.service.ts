@@ -1,7 +1,7 @@
 import { Inject, Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { Bot, Context, GrammyError } from 'grammy';
 import { BOT } from '../bot.provider';
-import { BotSubscriberService } from '../bot-subscriber.service';
+import { SubscriberService } from '../../core/subscriber/subscriber.service';
 import { NotificationReason } from '../../core/notifications/entities/notification.entity';
 import {
   categoryCaption,
@@ -17,7 +17,7 @@ import { toggleId, WizardState, WizardStateStore } from './wizard-state.store';
 /**
  * Reads and writes are deliberately split for UX, not just performance:
  * /start, /categories, /sources are pure reads — one SELECT via
- * BotSubscriberService.getBootstrapSnapshot, nothing else — so the reply
+ * SubscriberService.getBootstrapSnapshot, nothing else — so the reply
  * never waits on a write. /start's row-creating/activating write and
  * /stop's deactivation write both happen *after* the reply is already
  * sent, in the background; if either fails, a follow-up message asks the
@@ -25,8 +25,13 @@ import { toggleId, WizardState, WizardStateStore } from './wizard-state.store';
  * silently wrong. Toggling categories/sources never touches Postgres at
  * all — the enabled lists and in-progress picks both live in
  * WizardStateStore once fetched at bootstrap. Only "Done" writes anything,
- * via updateSubscriptions. See backup/*.ts.bak for earlier iterations of
- * this file.
+ * via updateSubscriptions.
+ *
+ * Calls Core's own SubscriberService directly (in-process DI, no HTTP hop)
+ * rather than the old BotSubscriberService raw-SQL duplicate — that class
+ * is still fully registered in TelegramBotModule as a rollback path, so
+ * reverting a call site here back to it is a one-line change. See
+ * backup/*.ts.bak for earlier iterations of this file.
  */
 @Injectable()
 export class TelegramCommandsService implements OnModuleInit {
@@ -34,7 +39,7 @@ export class TelegramCommandsService implements OnModuleInit {
 
   constructor(
     @Inject(BOT) private readonly bot: Bot,
-    private readonly botData: BotSubscriberService,
+    private readonly subscriber: SubscriberService,
     private readonly wizard: WizardStateStore,
   ) {}
 
@@ -51,7 +56,7 @@ export class TelegramCommandsService implements OnModuleInit {
     const chatId = String(ctx.chat.id);
 
     // Pure read — works even if this chat has never had a users row at all.
-    const snapshot = await this.botData.getBootstrapSnapshot(chatId);
+    const snapshot = await this.subscriber.getBootstrapSnapshot(chatId);
     this.wizard.start(chatId, {
       categoryIds: snapshot.categoryIds,
       sourceIds: snapshot.sourceIds,
@@ -73,7 +78,7 @@ export class TelegramCommandsService implements OnModuleInit {
 
     // The only write /start makes — deliberately after the reply above, so
     // a slow or failed write never delays what the user sees.
-    this.botData
+    this.subscriber
       .activateUserUpsert(chatId, ctx.from?.username)
       .catch((err: Error) => {
         this.logger.error(
@@ -100,7 +105,7 @@ export class TelegramCommandsService implements OnModuleInit {
         'To start receiving jobs again, send /start.',
     );
 
-    this.botData
+    this.subscriber
       .deactivateUser(chatId, NotificationReason.USER_UNSUBSCRIBED)
       .catch((err: Error) => {
         this.logger.error(
@@ -118,7 +123,7 @@ export class TelegramCommandsService implements OnModuleInit {
   private async handleCategoriesCommand(ctx: Context): Promise<void> {
     if (!ctx.chat) return;
     const chatId = String(ctx.chat.id);
-    const snapshot = await this.botData.getBootstrapSnapshot(chatId);
+    const snapshot = await this.subscriber.getBootstrapSnapshot(chatId);
     this.wizard.start(chatId, {
       categoryIds: snapshot.categoryIds,
       sourceIds: snapshot.sourceIds,
@@ -138,7 +143,7 @@ export class TelegramCommandsService implements OnModuleInit {
   private async handleSourcesCommand(ctx: Context): Promise<void> {
     if (!ctx.chat) return;
     const chatId = String(ctx.chat.id);
-    const snapshot = await this.botData.getBootstrapSnapshot(chatId);
+    const snapshot = await this.subscriber.getBootstrapSnapshot(chatId);
     this.wizard.start(chatId, {
       categoryIds: snapshot.categoryIds,
       sourceIds: snapshot.sourceIds,
@@ -220,7 +225,7 @@ export class TelegramCommandsService implements OnModuleInit {
     data: string,
   ): Promise<void> {
     const state = this.wizard.get(chatId);
-    await this.botData.activateUserUpsert(chatId, ctx.from?.username);
+    await this.subscriber.activateUserUpsert(chatId, ctx.from?.username);
 
     if (!state) {
       await ctx.answerCallbackQuery({
@@ -330,7 +335,7 @@ export class TelegramCommandsService implements OnModuleInit {
     chatId: string,
     state: WizardState,
   ): Promise<void> {
-    const updated = await this.botData.updateSubscriptions(
+    const updated = await this.subscriber.updateSubscriptions(
       chatId,
       state.categoryIds,
       state.sourceIds,

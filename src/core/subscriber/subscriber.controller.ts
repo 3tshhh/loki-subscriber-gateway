@@ -1,4 +1,11 @@
-import { Body, Controller, Get, Param, Post } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  NotFoundException,
+  Param,
+  Post,
+} from '@nestjs/common';
 import { SubscriberService } from './subscriber.service';
 import { UpdateSubscriptionsDto } from './dto/update-subscriptions.dto';
 import { BootstrapDto } from './dto/bootstrap.dto';
@@ -38,7 +45,11 @@ export class SubscriberController {
    */
   @Post('users/:chatId/bootstrap')
   async bootstrap(@Param('chatId') chatId: string, @Body() dto: BootstrapDto) {
-    return this.subscriber.bootstrap(chatId, dto.activate ?? false);
+    return this.subscriber.bootstrap(
+      chatId,
+      dto.activate ?? false,
+      dto.username,
+    );
   }
 
   @Get('categories')
@@ -71,18 +82,21 @@ export class SubscriberController {
     @Param('chatId') chatId: string,
     @Body() dto: UpdateSubscriptionsDto,
   ) {
-    await this.subscriber.updateSubscriptions(
+    return this.subscriber.updateSubscriptions(
       chatId,
       dto.categoryIds,
       dto.sourceIds,
+      dto.username,
     );
-    return this.subscriber.getUserSubscriptions(chatId);
   }
 
   /** /stop — also cancels this user's still-pending notifications. */
   @Post('users/:chatId/deactivate')
   async deactivate(@Param('chatId') chatId: string) {
-    await this.subscriber.deactivateUser(chatId);
+    const existed = await this.subscriber.deactivateUser(chatId);
+    if (!existed) {
+      throw new NotFoundException(`No user with chatId=${chatId}`);
+    }
     return { chatId, active: false };
   }
 }

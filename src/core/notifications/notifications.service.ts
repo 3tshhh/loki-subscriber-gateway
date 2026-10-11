@@ -54,4 +54,28 @@ export class NotificationsService {
       },
     );
   }
+
+  /**
+   * Bulk write for a dead-lettered notify:telegram entry (exhausted its
+   * XCLAIM retries without ever sending) — only rows still `pending` are
+   * touched, since some recipients in the same job may have already
+   * succeeded, been blocked, or been cancelled before the entry died.
+   */
+  async markDeliveryRetriesExhausted(
+    jobId: string,
+    chatIds: string[],
+  ): Promise<void> {
+    if (chatIds.length === 0) return;
+    await this.notifications
+      .createQueryBuilder()
+      .update()
+      .set({
+        status: 'failed',
+        reason: NotificationReason.DELIVERY_RETRIES_EXHAUSTED,
+      })
+      .where('job_id = :jobId', { jobId })
+      .andWhere('chat_id IN (:...chatIds)', { chatIds })
+      .andWhere('status = :pending', { pending: 'pending' })
+      .execute();
+  }
 }
