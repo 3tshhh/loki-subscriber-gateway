@@ -13,8 +13,9 @@ export type NotificationStatus = 'pending' | 'sent' | 'failed' | 'cancelled';
 /**
  * Why a row is in its current status — every row carries one, whatever its
  * status, so the column is never NULL. The outcome reasons (bot_blocked,
- * user_unsubscribed, recipient_inactive, delivery_retries_exhausted) are
- * set at the exact point each `failed`/`cancelled` outcome is detected,
+ * user_unsubscribed, recipient_inactive, delivery_retries_exhausted,
+ * delivery_status_unknown) are set at the exact point each
+ * `failed`/`cancelled` outcome is detected,
  * never inferred after the fact; `pending`/`sent` rows get their status's
  * own fixed reason.
  */
@@ -41,6 +42,12 @@ export enum NotificationReason {
   /** Exhausted MAX_DELIVERY_ATTEMPTS XCLAIM retries and was moved to the
    * dead-letter stream without ever successfully sending. */
   DELIVERY_RETRIES_EXHAUSTED = 'delivery_retries_exhausted',
+  /** Job-level resume found the row still `pending` but older than
+   * RESUME_WINDOW_SECONDS: an earlier notify:telegram entry may or may not
+   * have reached this recipient, and the per-job delivered set that would
+   * tell (and stop a resend) may already have expired. Rather than risk a
+   * duplicate, the row is marked `failed` and the job not resent to them. */
+  DELIVERY_STATUS_UNKNOWN = 'delivery_status_unknown',
   /** Backfill-only (FillAllNotificationColumns migration): a `failed`/
    * `cancelled` row written before the `reason` column existed, whose real
    * cause was never recorded. Used instead of guessing one; application
@@ -58,7 +65,8 @@ export type NotificationOutcomeReason =
   | NotificationReason.BOT_BLOCKED
   | NotificationReason.USER_UNSUBSCRIBED
   | NotificationReason.RECIPIENT_INACTIVE
-  | NotificationReason.DELIVERY_RETRIES_EXHAUSTED;
+  | NotificationReason.DELIVERY_RETRIES_EXHAUSTED
+  | NotificationReason.DELIVERY_STATUS_UNKNOWN;
 
 /** Every NotificationOutcomeReason value, for runtime validation (DTOs). */
 export const NOTIFICATION_OUTCOME_REASONS: readonly NotificationOutcomeReason[] =
@@ -67,6 +75,7 @@ export const NOTIFICATION_OUTCOME_REASONS: readonly NotificationOutcomeReason[] 
     NotificationReason.USER_UNSUBSCRIBED,
     NotificationReason.RECIPIENT_INACTIVE,
     NotificationReason.DELIVERY_RETRIES_EXHAUSTED,
+    NotificationReason.DELIVERY_STATUS_UNKNOWN,
   ];
 
 /** response_time_ms is a Postgres INTEGER — anything above this (~24.8

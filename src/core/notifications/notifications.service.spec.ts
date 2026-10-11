@@ -287,6 +287,41 @@ describe('NotificationsService', () => {
     });
   });
 
+  describe('markDeliveryStatusUnknown', () => {
+    it('closes only still-pending rows as failed / delivery_status_unknown with every status column filled', async () => {
+      await service.markDeliveryStatusUnknown('job-1', ['111']);
+
+      const values = (qb.set.mock.calls as unknown[][])[0][0] as Record<
+        string,
+        unknown
+      >;
+      expectAllStatusColumnsFilled(values);
+      expect(values).toEqual({
+        status: 'failed',
+        reason: NotificationReason.DELIVERY_STATUS_UNKNOWN,
+        statusChangedAt: new Date(NOW),
+        responseTimeMs: expect.any(Function) as unknown,
+      });
+      expect(qb.setParameter).toHaveBeenCalledWith('closedAt', new Date(NOW));
+      expect(qb.where).toHaveBeenCalledWith('job_id = :jobId', {
+        jobId: 'job-1',
+      });
+      expect(qb.andWhere).toHaveBeenCalledWith('chat_id IN (:...chatIds)', {
+        chatIds: ['111'],
+      });
+      expect(qb.andWhere).toHaveBeenCalledWith('status = :pending', {
+        pending: 'pending',
+      });
+      expect(qb.execute).toHaveBeenCalled();
+    });
+
+    it('writes nothing for an empty recipient list', async () => {
+      await service.markDeliveryStatusUnknown('job-1', []);
+
+      expect(repo.createQueryBuilder).not.toHaveBeenCalled();
+    });
+  });
+
   describe('closePendingNotifications', () => {
     it('computes response_time_ms in SQL as arrival-to-now, clamped to the INTEGER range', () => {
       const now = new Date(NOW);

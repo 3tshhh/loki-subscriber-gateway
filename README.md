@@ -253,7 +253,7 @@ can't compile.
 | ----------- | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------- |
 | `pending`   | insert time                     | `awaiting_delivery`                                                                                                                                    | job arrival → insert       |
 | `sent`      | when Telegram accepted the send | `delivered`                                                                                                                                            | job arrival → send         |
-| `failed`    | when the failure was detected   | `bot_blocked` (Telegram 403) or `delivery_retries_exhausted` (`notify:telegram` entry dead-lettered)                                                   | job arrival → failure      |
+| `failed`    | when the failure was detected   | `bot_blocked` (Telegram 403), `delivery_retries_exhausted` (`notify:telegram` entry dead-lettered), or `delivery_status_unknown` (too old to resume)   | job arrival → failure      |
 | `cancelled` | when the row was cancelled      | `user_unsubscribed` (`/stop`), `bot_blocked` (the chat's other pending rows, cancelled when a 403 deactivates it), or `recipient_inactive` (see below) | job arrival → cancellation |
 
 - **`sent_at` was renamed to `status_changed_at`** and now changes on every
@@ -315,18 +315,32 @@ can't compile.
   recorded original fan-out — deliberately not a fresh re-match, which could
   pull in subscribers who joined after the job arrived); only a job with no
   `pending` rows left is skipped as fully processed. Row inserts use
-  `ON CONFLICT DO NOTHING`, so they never duplicate either.
-- **Why a double `XADD` can't double-send.** Resume can hand off a job whose
-  first `notify:telegram` entry did go out (crash after the `XADD` but before
-  the ack, or the producer redelivering the same `jobId` while the first
-  fan-out is still sending). `TelegramDispatchService.deliverOne` atomically
-  `SADD`s the chat_id into `notif:delivered:{jobId}` **before** sending and
-  skips it if it was already a member — `SADD`'s own return value is the
-  check, so even two entries for the same job processed concurrently by
-  different senders produce exactly one send per recipient. A transient send
-  failure `SREM`s the claim and throws, leaving that entry unacked for
-  `XCLAIM` to retry, so the recipient is never stranded. A permanent (403)
-  failure keeps the claim, so a retry won't try again.
+  `ON CONFLICT DO NOTHING`, so they never duplicate either. Only `pending`
+  rows whose `status_changed_at` (their insert time) is within
+  `RESUME_WINDOW_SECONDS` — the 7-day delivered-set TTL minus a 1-hour
+  safety margin — are re-handed off. Older ones are marked `failed` /
+  `delivery_status_unknown` and not resent: by then the delivered set below
+  may have expired, so whether an earlier attempt reached them can no longer
+  be told, and resending could duplicate.
+- **Why a double `XADD` doesn't double-send (inside the resume window).**
+  Resume can hand off a job whose first `notify:telegram` entry did go out
+  (crash after the `XADD` but before the ack, or the producer redelivering
+  the same `jobId` while the first fan-out is still sending).
+  `TelegramDispatchService.deliverOne` atomically `SADD`s the chat_id into
+  `notif:delivered:{jobId}` **before** sending and skips it if it was
+  already a member — `SADD`'s own return value is the check, so even two
+  entries for the same job processed concurrently by different senders
+  produce at most one send per recipient — **as long as the set still
+  exists**. Every claim re-arms its 7-day TTL and happens after the job's
+  rows were inserted, so the set lasts at least 7 days past a row's insert
+  time, and resume never re-hands off a row older than
+  `RESUME_WINDOW_SECONDS` (7 days − 1 hour). The remaining exposure is a
+  re-handed-off `notify:telegram` entry that isn't processed until more than
+  that 1-hour margin later (e.g. senders down for hours right at the edge of
+  the window). A transient send failure `SREM`s the claim and throws,
+  leaving that entry unacked for `XCLAIM` to retry, so the recipient is
+  never stranded. A permanent (403) failure keeps the claim, so a retry
+  won't try again.
 - A 429 from Telegram carries its own `retry_after`; `sendWithRetry` waits
   exactly that long and retries the send directly (3 attempts total) instead
   of failing the whole batch and waiting for the next sweep.

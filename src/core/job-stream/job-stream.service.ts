@@ -15,6 +15,7 @@ import {
   MAX_DELIVERY_ATTEMPTS,
   REDIS_CLIENT,
   REDIS_STREAMS,
+  RESUME_WINDOW_SECONDS,
   StreamConsumer,
   StreamEntry,
   streamEntryTimestampMs,
@@ -150,14 +151,37 @@ export class JobStreamService implements OnModuleInit, OnModuleDestroy {
     // that case the winner SREMs the claim and throws, leaving *its*
     // entry unacked for XCLAIM to retry, so the recipient is still
     // covered.
-    const recorded = await this.findRecordedRecipients(jobId);
+    //
+    // That guarantee only lasts as long as notif:delivered:{jobId} does,
+    // though — it's TTL'd. So only pending rows inside RESUME_WINDOW_SECONDS
+    // (see its comment for why that bound is safe) are re-handed off. Older
+    // pending rows may or may not have been sent, and the set that would
+    // tell may be gone, so they're closed as `failed` /
+    // delivery_status_unknown and never resent. The cutoff is a JS Date
+    // bound as a parameter, never SQL now(): status_changed_at is a
+    // `timestamp` written from this process's clock, so comparing against
+    // the same clock keeps it right even if Node and the database session
+    // disagree on time zone (the same reason closePendingNotifications
+    // binds :closedAt).
+    const resumeCutoff = new Date(Date.now() - RESUME_WINDOW_SECONDS * 1000);
+    const recorded = await this.findRecordedRecipients(jobId, resumeCutoff);
     const isRetry = recorded.length > 0;
     let chatIds: string[];
 
     if (isRetry) {
-      chatIds = recorded
-        .filter((row) => row.status === 'pending')
+      const pending = recorded.filter((row) => row.status === 'pending');
+      chatIds = pending
+        .filter((row) => row.resumable)
         .map((row) => row.chat_id);
+      const stale = pending
+        .filter((row) => !row.resumable)
+        .map((row) => row.chat_id);
+      if (stale.length > 0) {
+        this.logger.warn(
+          `Job ${jobId} has ${stale.length} recipient(s) pending for longer than the ${RESUME_WINDOW_SECONDS}s resume window — marking them failed (delivery status unknown) instead of risking a resend`,
+        );
+        await this.notifications.markDeliveryStatusUnknown(jobId, stale);
+      }
       if (chatIds.length === 0) {
         this.logger.debug(`Job ${jobId} already fully processed, skipping`);
         await this.redis.xdel(REDIS_STREAMS.jobsDelivering, entry.id);
@@ -306,16 +330,21 @@ export class JobStreamService implements OnModuleInit, OnModuleDestroy {
 
   /**
    * Every notifications row already recorded for this job, with its
-   * status. Queried directly rather than through NotificationsService,
-   * since all this needs is a read of the recipients an earlier attempt
-   * recorded (see the retry handling in handleJob).
+   * status and whether its status_changed_at is at or after
+   * `resumeCutoff` — for a `pending` row (whose status_changed_at is its
+   * insert time), whether it's still inside the resume window. Queried
+   * directly rather than through NotificationsService, since all this
+   * needs is a read of the recipients an earlier attempt recorded (see the
+   * retry handling in handleJob).
    */
   private async findRecordedRecipients(
     jobId: string,
-  ): Promise<{ chat_id: string; status: string }[]> {
+    resumeCutoff: Date,
+  ): Promise<{ chat_id: string; status: string; resumable: boolean }[]> {
     return this.dataSource.query(
-      `SELECT chat_id, status FROM notifications WHERE job_id = $1`,
-      [jobId],
+      `SELECT chat_id, status, status_changed_at >= CAST($2 AS timestamp) AS resumable
+       FROM notifications WHERE job_id = $1`,
+      [jobId, resumeCutoff],
     );
   }
 

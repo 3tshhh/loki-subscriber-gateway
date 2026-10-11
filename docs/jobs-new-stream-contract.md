@@ -166,13 +166,23 @@ retried, since retrying can't fix them:
     interrupted between recording recipients and handing them off. The job
     is re-handed off to **exactly those still-pending recipients** — the
     original fan-out, not a fresh match, so subscribers who joined later
-    are not added.
+    are not added — but only those recorded less than
+    `RESUME_WINDOW_SECONDS` ago (7 days minus a 1-hour safety margin).
+    Older still-pending recipients are marked `failed` /
+    `delivery_status_unknown` and **not** re-sent: whether an earlier
+    attempt reached them can no longer be told safely (see below).
 - This means: redelivering the exact same `jobId` (e.g. Python retries an
   `XADD` after a timeout, unsure whether the first one went through) is
   **safe** — it will not double-notify subscribers, even if it lands while
   the first delivery is still in progress: each recipient is atomically
   claimed in a per-job Redis set before sending, so at most one send per
-  recipient goes out.
+  recipient goes out **while that set exists**. The set is kept for 7 days
+  after its most recent claim, and resume only re-sends to recipients
+  recorded within `RESUME_WINDOW_SECONDS` of now, so the guarantee holds
+  for any redelivery inside that window — provided the re-handed-off batch
+  is actually sent within the 1-hour margin. A redelivery after the window
+  either finds every recipient resolved (skipped) or closes the stale ones
+  as `delivery_status_unknown` rather than risking a duplicate.
 - It also means: **`jobId` must never be reused for a genuinely different
   job** — the second one would be silently treated as a duplicate and
   never delivered to anyone.

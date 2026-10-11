@@ -184,4 +184,27 @@ export class NotificationsService {
       .andWhere('status = :pending', { pending: 'pending' })
       .execute();
   }
+
+  /**
+   * Bulk write for job-level resume's stale rows: recipients still
+   * `pending` past RESUME_WINDOW_SECONDS, which are no longer safe to
+   * re-hand off (see NotificationReason.DELIVERY_STATUS_UNKNOWN). Same
+   * shape as markDeliveryRetriesExhausted — only rows still `pending` are
+   * touched, with response_time_ms computed in SQL as arrival→now.
+   */
+  async markDeliveryStatusUnknown(
+    jobId: string,
+    chatIds: string[],
+  ): Promise<void> {
+    if (chatIds.length === 0) return;
+    await closePendingNotifications(
+      this.notifications.createQueryBuilder().update(),
+      'failed',
+      NotificationReason.DELIVERY_STATUS_UNKNOWN,
+    )
+      .where('job_id = :jobId', { jobId })
+      .andWhere('chat_id IN (:...chatIds)', { chatIds })
+      .andWhere('status = :pending', { pending: 'pending' })
+      .execute();
+  }
 }

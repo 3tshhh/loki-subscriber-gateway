@@ -15,6 +15,27 @@ export const REDIS_KEYS = {
 /** How long a per-job delivered-set is kept before it's safe to expire. */
 export const DELIVERED_SET_TTL_SECONDS = 7 * 24 * 60 * 60;
 
+/**
+ * How old a `pending` notifications row (its status_changed_at, i.e. its
+ * insert time) may be for job-level resume to still re-hand it off.
+ *
+ * Re-handing off is only send-once-safe while notif:delivered:{jobId}
+ * still exists: it's what makes dispatch skip a recipient an earlier
+ * notify:telegram entry already sent to. Every claim (SADD) re-arms that
+ * set's TTL to DELIVERED_SET_TTL_SECONDS, and every claim happens after the
+ * job's rows were inserted, so a set that ever got a member can't expire
+ * sooner than insert + DELIVERED_SET_TTL_SECONDS. Past that, an expired set
+ * is indistinguishable from "never claimed", and resuming could resend.
+ *
+ * The one-hour margin under the TTL absorbs clock skew between this
+ * process (which writes status_changed_at) and Redis (which runs the TTL),
+ * plus the time between the resume decision and dispatch actually claiming
+ * each recipient of the re-handed-off notify:telegram entry. A pending row
+ * older than this is closed as `failed` / delivery_status_unknown instead
+ * of being resent — see JobStreamService.handleJob.
+ */
+export const RESUME_WINDOW_SECONDS = DELIVERED_SET_TTL_SECONDS - 60 * 60;
+
 export const REDIS_STREAMS = {
   jobsNew: 'jobs:notify',
   /** Holds a job's fields for exactly as long as it's actively being

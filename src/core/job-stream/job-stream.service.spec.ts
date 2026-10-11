@@ -2,7 +2,11 @@ import { Logger } from '@nestjs/common';
 import type { ConfigService } from '@nestjs/config';
 import type Redis from 'ioredis';
 import type { DataSource } from 'typeorm';
-import { REDIS_STREAMS, StreamEntry } from '../../shared/redis';
+import {
+  REDIS_STREAMS,
+  RESUME_WINDOW_SECONDS,
+  StreamEntry,
+} from '../../shared/redis';
 import type { NotificationsService } from '../notifications/notifications.service';
 import { JobStreamService } from './job-stream.service';
 
@@ -37,11 +41,14 @@ describe('JobStreamService', () => {
 
   let redis: { xadd: jest.Mock; xdel: jest.Mock; xrange: jest.Mock };
   let dataSource: { query: jest.Mock };
-  let notifications: { insertPendingForChats: jest.Mock };
+  let notifications: {
+    insertPendingForChats: jest.Mock;
+    markDeliveryStatusUnknown: jest.Mock;
+  };
   let service: JobStreamService;
 
   /** Rows the mocked Postgres hands back, keyed by which table is queried. */
-  let recordedRows: { chat_id: string; status: string }[];
+  let recordedRows: { chat_id: string; status: string; resumable: boolean }[];
   let subscriberRows: { chat_id: string }[];
   let categoryRows: { name: string }[];
 
@@ -71,6 +78,7 @@ describe('JobStreamService', () => {
     };
     notifications = {
       insertPendingForChats: jest.fn().mockResolvedValue(undefined),
+      markDeliveryStatusUnknown: jest.fn().mockResolvedValue(undefined),
     };
     const config = {
       get: jest.fn((key: string) => (key === 'NODE_ENV' ? 'test' : undefined)),
@@ -305,10 +313,10 @@ describe('JobStreamService', () => {
 
     it('re-hands off a partially processed job only to its still-pending recipients, without re-matching', async () => {
       recordedRows = [
-        { chat_id: '111', status: 'sent' },
-        { chat_id: '222', status: 'pending' },
-        { chat_id: '333', status: 'failed' },
-        { chat_id: '444', status: 'pending' },
+        { chat_id: '111', status: 'sent', resumable: true },
+        { chat_id: '222', status: 'pending', resumable: true },
+        { chat_id: '333', status: 'failed', resumable: true },
+        { chat_id: '444', status: 'pending', resumable: true },
       ];
       subscriberRows = [{ chat_id: '999' }];
       const entry = contractEntry();
@@ -319,16 +327,84 @@ describe('JobStreamService', () => {
       expect(queries.some((sql) => sql.includes('FROM users'))).toBe(false);
       expect(notifications.insertPendingForChats).not.toHaveBeenCalled();
       expect(notifyFields().chatIds).toBe(JSON.stringify(['222', '444']));
+      expect(notifications.markDeliveryStatusUnknown).not.toHaveBeenCalled();
       expect(redis.xdel).toHaveBeenCalledWith(
         REDIS_STREAMS.jobsDelivering,
         entry.id,
       );
     });
 
+    it('asks Postgres which rows are inside the resume window using a cutoff from the app clock', async () => {
+      const NOW = 1_700_900_000_000;
+      jest.useFakeTimers({ now: NOW });
+      try {
+        await handle(contractEntry());
+      } finally {
+        jest.useRealTimers();
+      }
+
+      const call = dataSource.query.mock.calls.find(([sql]) =>
+        String(sql).includes('FROM notifications'),
+      ) as [string, unknown[]];
+      expect(call[0]).toContain('status_changed_at >= CAST($2 AS timestamp)');
+      expect(call[0]).not.toMatch(/now\(\)/i);
+      expect(call[1]).toEqual([
+        'job-1',
+        new Date(NOW - RESUME_WINDOW_SECONDS * 1000),
+      ]);
+    });
+
+    it('marks pending rows older than the resume window as delivery-status-unknown and resumes only the rest', async () => {
+      recordedRows = [
+        { chat_id: '111', status: 'sent', resumable: false },
+        { chat_id: '222', status: 'pending', resumable: false },
+        { chat_id: '333', status: 'pending', resumable: true },
+      ];
+
+      await handle(contractEntry());
+
+      expect(notifications.markDeliveryStatusUnknown).toHaveBeenCalledWith(
+        'job-1',
+        ['222'],
+      );
+      expect(notifyFields().chatIds).toBe(JSON.stringify(['333']));
+    });
+
+    it('does not hand off at all when every pending row is past the resume window', async () => {
+      recordedRows = [
+        { chat_id: '222', status: 'pending', resumable: false },
+        { chat_id: '333', status: 'pending', resumable: false },
+      ];
+      const entry = contractEntry();
+
+      await handle(entry);
+
+      expect(notifications.markDeliveryStatusUnknown).toHaveBeenCalledWith(
+        'job-1',
+        ['222', '333'],
+      );
+      expect(redis.xadd).not.toHaveBeenCalled();
+      expect(redis.xdel).toHaveBeenCalledWith(
+        REDIS_STREAMS.jobsDelivering,
+        entry.id,
+      );
+    });
+
+    it('leaves the entry unacked when closing stale rows fails', async () => {
+      recordedRows = [{ chat_id: '222', status: 'pending', resumable: false }];
+      notifications.markDeliveryStatusUnknown.mockRejectedValue(
+        new Error('db down'),
+      );
+
+      await expect(handle(contractEntry())).rejects.toThrow('db down');
+      expect(redis.xadd).not.toHaveBeenCalled();
+      expect(redis.xdel).not.toHaveBeenCalled();
+    });
+
     it('skips (XDELs) a retried job none of whose recipients is still pending', async () => {
       recordedRows = [
-        { chat_id: '111', status: 'sent' },
-        { chat_id: '222', status: 'cancelled' },
+        { chat_id: '111', status: 'sent', resumable: true },
+        { chat_id: '222', status: 'cancelled', resumable: true },
       ];
       const entry = contractEntry();
 
