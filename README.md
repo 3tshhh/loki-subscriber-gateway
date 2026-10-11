@@ -266,6 +266,16 @@ can't compile.
   `status_changed_at − created_at` (the true arrival time was never stored),
   so treat legacy latencies as lower bounds.
 - `response_time_ms` is a Postgres `INTEGER`, clamped to `[0, 2147483647]`.
+- **Run Node and Postgres in the same time zone (UTC recommended).**
+  `created_at` is filled by Postgres's `now()`, while `status_changed_at` is
+  written from Node's clock as a JS `Date` into a `timestamp` (no time zone)
+  column, i.e. as Node's local wall-clock time. If the two run with
+  different `TZ`s, the columns are offset from each other by the difference,
+  so comparing them (e.g. `status_changed_at − created_at`) is meaningless.
+  The application's own arithmetic (response times, the resume window)
+  only ever compares `status_changed_at` against Node's clock, so it's
+  unaffected either way; the one exception is the `FillAllNotificationColumns`
+  backfill, which derived legacy `response_time_ms` values from the two.
 - **`recipient_inactive`**: when dispatch comes to send and the chat is no
   longer in `users:active`, nothing is sent and the row — only if it's still
   `pending`, so `/stop`'s own `user_unsubscribed` is kept — is closed as
@@ -480,13 +490,14 @@ categoryIds, sourceIds, username)` write, followed by a combined review
 - **No fixed/admin broadcast destination**: this repo only does
   subscriber-based routing, per the spec's explicit non-goal. A "send every
   job to one ops channel" path would be a separate feature.
-- **At-least-once delivery, with gaps in the status record**: a crash
-  between a Telegram send succeeding and its `sent` status write can leave a
-  row `pending` even though the message went out (the delivered-set claim
-  prevents a resend, so it stays `pending`). Same for a recipient skipped
-  because they're missing from `users:active`. This is accepted rather than
-  building transactional-outbox logic on top of the streams — flag if
-  stronger guarantees are needed.
+- **At most one send per recipient (inside the resume window), with gaps in
+  the status record**: a crash between a Telegram send succeeding and its
+  `sent` status write can leave a row `pending` even though the message went
+  out (the delivered-set claim prevents a resend, so it stays `pending` —
+  unless the job is later resumed after `RESUME_WINDOW_SECONDS`, which
+  closes it as `failed` / `delivery_status_unknown`). This is accepted
+  rather than building transactional-outbox logic on top of the streams —
+  flag if stronger guarantees are needed.
 - **Job messages are HTML-formatted with an inline button** — see
   `src/telegram-bot/dispatch/message-builder.ts` (ported from the pre-split
   pipeline's `message_builder.py`, channel/subscriber-style branch only).
