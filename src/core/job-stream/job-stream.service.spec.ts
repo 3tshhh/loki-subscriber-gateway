@@ -7,6 +7,7 @@ import {
   RESUME_WINDOW_SECONDS,
   StreamEntry,
 } from '../../shared/redis';
+import { StreamConsumer } from '../../shared/redis/stream-consumer';
 import type { NotificationsService } from '../notifications/notifications.service';
 import { JobStreamService } from './job-stream.service';
 
@@ -32,14 +33,13 @@ type NormalizedEntry = {
 type JobStreamInternals = {
   normalizeEntry(fields: Record<string, string>): NormalizedEntry;
   handleJob(entry: StreamEntry): Promise<void>;
-  removeDeadLetteredEntry(fields: Record<string, string>): Promise<void>;
 };
 
 describe('JobStreamService', () => {
   const ORIGINAL_ID = '1700000000000-0';
   const ORIGINAL_MS = 1700000000000;
 
-  let redis: { xadd: jest.Mock; xdel: jest.Mock; xrange: jest.Mock };
+  let redis: { xadd: jest.Mock; xdel: jest.Mock };
   let dataSource: { query: jest.Mock };
   let notifications: {
     insertPendingForChats: jest.Mock;
@@ -64,7 +64,6 @@ describe('JobStreamService', () => {
     redis = {
       xadd: jest.fn().mockResolvedValue('1700000000001-0'),
       xdel: jest.fn().mockResolvedValue(1),
-      xrange: jest.fn().mockResolvedValue([]),
     };
     dataSource = {
       query: jest.fn((sql: string) => {
@@ -129,6 +128,32 @@ describe('JobStreamService', () => {
     for (let i = 0; i < flat.length; i += 2) fields[flat[i]] = flat[i + 1];
     return fields;
   };
+
+  describe('onModuleInit', () => {
+    it('dead-letters jobs:delivering entries and has the consumer delete them from the stream', async () => {
+      const start = jest
+        .spyOn(StreamConsumer.prototype, 'start')
+        .mockResolvedValue(undefined);
+      try {
+        await service.onModuleInit();
+      } finally {
+        start.mockRestore();
+      }
+
+      const consumer = (
+        service as unknown as {
+          consumer: { options: Record<string, unknown> };
+        }
+      ).consumer;
+      expect(consumer.options).toEqual(
+        expect.objectContaining({
+          deadLetterStream: REDIS_STREAMS.jobsDeliveringDead,
+          deleteOnDeadLetter: true,
+        }),
+      );
+      expect(consumer.options).not.toHaveProperty('onDeadLetter');
+    });
+  });
 
   describe('normalizeEntry', () => {
     it('passes an entry in the documented contract shape through untouched', () => {
@@ -451,34 +476,6 @@ describe('JobStreamService', () => {
       await expect(handle(contractEntry())).rejects.toThrow(
         'connection refused',
       );
-      expect(redis.xdel).not.toHaveBeenCalled();
-    });
-  });
-
-  describe('removeDeadLetteredEntry', () => {
-    const remove = (fields: Record<string, string>): Promise<void> =>
-      (service as unknown as JobStreamInternals).removeDeadLetteredEntry(
-        fields,
-      );
-
-    it('XDELs the jobs:delivering entry carrying the same _originalId', async () => {
-      redis.xrange.mockResolvedValueOnce([
-        ['1-0', ['jobId', 'a', '_originalId', 'other']],
-        ['2-0', ['jobId', 'b', '_originalId', ORIGINAL_ID]],
-      ]);
-
-      await remove({ jobId: 'b', _originalId: ORIGINAL_ID });
-
-      expect(redis.xdel).toHaveBeenCalledWith(
-        REDIS_STREAMS.jobsDelivering,
-        '2-0',
-      );
-    });
-
-    it('does nothing when the fields carry no _originalId', async () => {
-      await remove({ jobId: 'b' });
-
-      expect(redis.xrange).not.toHaveBeenCalled();
       expect(redis.xdel).not.toHaveBeenCalled();
     });
   });

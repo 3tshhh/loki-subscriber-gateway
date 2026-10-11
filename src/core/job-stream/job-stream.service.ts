@@ -76,7 +76,15 @@ export class JobStreamService implements OnModuleInit, OnModuleDestroy {
         // replayed by hand.
         maxDeliveryAttempts: MAX_DELIVERY_ATTEMPTS,
         deadLetterStream: REDIS_STREAMS.jobsDeliveringDead,
-        onDeadLetter: (fields) => this.removeDeadLetteredEntry(fields),
+        // jobs:delivering should only ever hold what's genuinely in
+        // flight, so a given-up entry is also deleted from it — by the
+        // consumer, by its own id, and only once the dead-letter copy and
+        // the ack have both succeeded, so it can never be lost in between.
+        // Notification rows the entry may already have inserted are
+        // deliberately left `pending`: replaying the dead-lettered entry
+        // into jobs:delivering later hands them off again via the normal
+        // retry path in handleJob (within RESUME_WINDOW_SECONDS).
+        deleteOnDeadLetter: true,
       },
     );
     await this.consumer.start();
@@ -346,59 +354,6 @@ export class JobStreamService implements OnModuleInit, OnModuleDestroy {
        FROM notifications WHERE job_id = $1`,
       [jobId, resumeCutoff],
     );
-  }
-
-  /**
-   * Called by StreamConsumer right before it dead-letters a jobs:delivering
-   * entry that exhausted its delivery attempts. The consumer itself only
-   * copies the entry to jobs:delivering:dead and acks it — it never XDELs
-   * — which would leave a permanently-given-up entry sitting in
-   * jobs:delivering, a stream meant to hold only what's genuinely in
-   * flight. So it's deleted here.
-   *
-   * The callback is only handed the entry's fields, not its own id, so the
-   * entry is found by its `_originalId` (the jobs:notify id JobMoverService
-   * stamps on every entry it moves, unique per moved entry). That's a scan
-   * of jobs:delivering, but a cheap one: the stream only ever holds
-   * in-flight work, and this only runs for the rare entry that gives up
-   * for good. Notification rows the entry may already have inserted are
-   * deliberately left `pending`: replaying the dead-lettered entry into
-   * jobs:delivering later hands them off again via the normal retry path.
-   */
-  private async removeDeadLetteredEntry(
-    fields: Record<string, string>,
-  ): Promise<void> {
-    const originalId = fields._originalId;
-    if (!originalId) {
-      this.logger.warn(
-        `Dead-lettered jobs:delivering entry has no _originalId, so it can't be located to delete it from ${REDIS_STREAMS.jobsDelivering}`,
-      );
-      return;
-    }
-
-    const pageSize = 100;
-    let start = '-';
-    for (;;) {
-      const page = (await this.redis.xrange(
-        REDIS_STREAMS.jobsDelivering,
-        start,
-        '+',
-        'COUNT',
-        pageSize,
-      )) as [string, string[]][];
-
-      for (const [id, flat] of page) {
-        for (let i = 0; i < flat.length; i += 2) {
-          if (flat[i] === '_originalId' && flat[i + 1] === originalId) {
-            await this.redis.xdel(REDIS_STREAMS.jobsDelivering, id);
-            return;
-          }
-        }
-      }
-
-      if (page.length < pageSize) return;
-      start = `(${page[page.length - 1][0]}`;
-    }
   }
 
   /**

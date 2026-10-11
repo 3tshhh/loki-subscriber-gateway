@@ -168,6 +168,8 @@ describe('StreamConsumer', () => {
         expect.any(String),
       );
       expect(redis.xack).toHaveBeenCalledWith(STREAM, GROUP, '1-0');
+      // Without deleteOnDeadLetter the original stays in the stream.
+      expect(redis.xdel).not.toHaveBeenCalled();
 
       // At or under the cap: claimed and run through the normal handler.
       expect(redis.xclaim).toHaveBeenCalledWith(
@@ -208,6 +210,51 @@ describe('StreamConsumer', () => {
         expect.any(String),
       );
       expect(redis.xack).toHaveBeenCalledWith(STREAM, GROUP, '1-0');
+    });
+
+    describe('with deleteOnDeadLetter', () => {
+      const deletingOptions = () => ({
+        ...deadLetterOptions(),
+        deleteOnDeadLetter: true,
+      });
+
+      it('XDELs the entry by its own id only after the dead-letter XADD and the XACK', async () => {
+        redis.xpending.mockResolvedValueOnce(pending(['1-0', 6], ['3-0', 1]));
+
+        await sweep(consumer(deletingOptions()));
+
+        expect(redis.xdel).toHaveBeenCalledTimes(1);
+        expect(redis.xdel).toHaveBeenCalledWith(STREAM, '1-0');
+        const xaddOrder = redis.xadd.mock.invocationCallOrder[0];
+        const xackOrder = redis.xack.mock.invocationCallOrder[0];
+        const xdelOrder = redis.xdel.mock.invocationCallOrder[0];
+        expect(xaddOrder).toBeLessThan(xackOrder);
+        expect(xackOrder).toBeLessThan(xdelOrder);
+        // Never scans the stream to find it.
+        expect(redis.xrange).not.toHaveBeenCalled();
+      });
+
+      it('neither acks nor deletes the entry when copying it to the dead-letter stream fails', async () => {
+        redis.xpending.mockResolvedValueOnce(pending(['1-0', 6]));
+        redis.xadd.mockRejectedValue(new Error('OOM'));
+
+        await expect(sweep(consumer(deletingOptions()))).rejects.toThrow('OOM');
+
+        expect(redis.xack).not.toHaveBeenCalled();
+        expect(redis.xdel).not.toHaveBeenCalled();
+      });
+
+      it('does not delete the entry when the XACK fails', async () => {
+        redis.xpending.mockResolvedValueOnce(pending(['1-0', 6]));
+        redis.xack.mockRejectedValue(new Error('connection lost'));
+
+        await expect(sweep(consumer(deletingOptions()))).rejects.toThrow(
+          'connection lost',
+        );
+
+        expect(redis.xadd).toHaveBeenCalledTimes(1);
+        expect(redis.xdel).not.toHaveBeenCalled();
+      });
     });
 
     it('leaves a reclaimed entry unacked when its handler throws', async () => {

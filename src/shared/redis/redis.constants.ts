@@ -48,7 +48,8 @@ export const REDIS_STREAMS = {
   /** jobs:delivering entries that exceeded MAX_DELIVERY_ATTEMPTS (e.g. one
    * that keeps failing because Postgres is unreachable for it) land here
    * instead of being reclaimed every sweep forever. Each is also deleted
-   * from jobsDelivering at that point, so jobsDelivering keeps holding only
+   * from jobsDelivering (StreamConsumer's deleteOnDeadLetter, only once the
+   * copy here and the ack have succeeded), so jobsDelivering keeps holding only
    * genuinely in-flight work — this stream is the record of what gave up,
    * and an entry here can be replayed by re-XADDing its fields into
    * jobsDelivering once the underlying problem is fixed. */

@@ -63,6 +63,16 @@ export class StreamConsumer {
        * that domain. Failures here are logged and swallowed; they never
        * block the dead-lettering itself. */
       onDeadLetter?: (fields: Record<string, string>) => Promise<void>;
+      /** Also XDEL each dead-lettered entry from this stream, by its own
+       * id — for a stream meant to hold only in-flight work, where a
+       * permanently given-up entry shouldn't linger once it's been parked.
+       * Runs strictly after the entry's XADD to deadLetterStream and its
+       * XACK have both succeeded, so the entry is never deleted before a
+       * copy of it is safely on the dead-letter stream; if either fails,
+       * the entry is left exactly where it was (still on the PEL) for the
+       * next sweep to try again. Omit to keep dead-lettered entries in the
+       * stream (acked, so they're never redelivered). */
+      deleteOnDeadLetter?: boolean;
       /** Caps how much undelivered backlog this group is handed on startup.
        * If more than this many entries piled up after this group's
        * last-delivered-id while nothing was consuming, the oldest excess is
@@ -302,7 +312,8 @@ export class StreamConsumer {
 
   /** Claims entries just to read their fields, moves each to the
    * dead-letter stream with a reason, then acks the original so it stops
-   * cycling through claim/fail/reclaim. */
+   * cycling through claim/fail/reclaim — and, with deleteOnDeadLetter,
+   * only then deletes the original from this stream. */
   private async deadLetter(ids: string[]): Promise<void> {
     if (!this.options.deadLetterStream) {
       // Nowhere to put them — reclaim instead of silently dropping work.
@@ -346,6 +357,9 @@ export class StreamConsumer {
         String(Date.now()),
       );
       await this.redis.xack(this.stream, this.group, id);
+      if (this.options.deleteOnDeadLetter) {
+        await this.redis.xdel(this.stream, id);
+      }
       this.logger.error(
         `${this.stream}#${id} exceeded max delivery attempts, moved to ${this.options.deadLetterStream}`,
       );

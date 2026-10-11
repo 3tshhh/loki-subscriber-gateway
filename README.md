@@ -290,11 +290,15 @@ can't compile.
   `notify:telegram:dead`, with `_deadLetteredFromId`, `_reason`, `_deadLetteredAt`)
   and acked, instead of cycling through claim/fail/reclaim forever. For
   `notify:telegram`, the entry's still-`pending` recipients are marked
-  `failed` / `delivery_retries_exhausted`. For `jobs:delivering`, the entry
-  is also `XDEL`ed from `jobs:delivering`, and any `pending` rows it already
-  inserted are deliberately left `pending` — re-`XADD`ing the dead-lettered
+  `failed` / `delivery_retries_exhausted`. For `jobs:delivering`, the
+  consumer (`deleteOnDeadLetter`) also `XDEL`s the entry from
+  `jobs:delivering` by its own id, strictly after the dead-letter `XADD` and
+  the `XACK` have both succeeded: if either fails, the entry stays where it
+  was, on the PEL, and the next sweep tries again (at worst leaving a second
+  copy on the dead-letter stream, never none). Any `pending` rows it already
+  inserted are deliberately left `pending`: re-`XADD`ing the dead-lettered
   fields into `jobs:delivering` once the underlying problem is fixed resumes
-  them through the normal retry path below. `jobs:notify` has no cap: its
+  them through the normal retry path below (within its resume window). `jobs:notify` has no cap: its
   only work is a move, so it just retries.
 - **Startup backlog cap.** If a group's undelivered backlog on
   `jobs:notify` or `jobs:delivering` exceeds `JOB_STREAM_BACKLOG_CAP`
