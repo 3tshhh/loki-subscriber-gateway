@@ -10,9 +10,19 @@ import { UserEntity } from '../../subscriber/entities/user.entity';
 
 export type NotificationStatus = 'pending' | 'sent' | 'failed' | 'cancelled';
 
-/** Why a `failed`/`cancelled` row ended up that way — set at the exact
- * point each outcome is detected, never inferred after the fact. */
+/**
+ * Why a row is in its current status — every row carries one, whatever its
+ * status, so the column is never NULL. The outcome reasons (bot_blocked,
+ * user_unsubscribed, delivery_retries_exhausted) are set at the exact point
+ * each `failed`/`cancelled` outcome is detected, never inferred after the
+ * fact; `pending`/`sent` rows get their status's own fixed reason.
+ */
 export enum NotificationReason {
+  /** The row's `pending` reason: matched and persisted, handed off to the
+   * telegram-bot module, not yet resolved either way. */
+  AWAITING_DELIVERY = 'awaiting_delivery',
+  /** The row's `sent` reason: Telegram accepted the message. */
+  DELIVERED = 'delivered',
   /** Telegram returned 403 (recipient blocked the bot) — the delivery
    * attempt itself is marked `failed` with this reason, and it also
    * triggers the cascading `cancelled` on that chat's other pending rows. */
@@ -22,6 +32,45 @@ export enum NotificationReason {
   /** Exhausted MAX_DELIVERY_ATTEMPTS XCLAIM retries and was moved to the
    * dead-letter stream without ever successfully sending. */
   DELIVERY_RETRIES_EXHAUSTED = 'delivery_retries_exhausted',
+  /** Backfill-only (FillAllNotificationColumns migration): a `failed`/
+   * `cancelled` row written before the `reason` column existed, whose real
+   * cause was never recorded. Used instead of guessing one; application
+   * code never writes it. */
+  UNKNOWN_LEGACY = 'unknown_legacy',
+}
+
+/**
+ * The reasons application code may give a `failed`/`cancelled` row — the
+ * per-status reasons (AWAITING_DELIVERY/DELIVERED) are derived from the
+ * status itself, and UNKNOWN_LEGACY only exists for backfilled history, so
+ * neither can be passed in by mistake.
+ */
+export type NotificationOutcomeReason =
+  | NotificationReason.BOT_BLOCKED
+  | NotificationReason.USER_UNSUBSCRIBED
+  | NotificationReason.DELIVERY_RETRIES_EXHAUSTED;
+
+/** Every NotificationOutcomeReason value, for runtime validation (DTOs). */
+export const NOTIFICATION_OUTCOME_REASONS: readonly NotificationOutcomeReason[] =
+  [
+    NotificationReason.BOT_BLOCKED,
+    NotificationReason.USER_UNSUBSCRIBED,
+    NotificationReason.DELIVERY_RETRIES_EXHAUSTED,
+  ];
+
+/** response_time_ms is a Postgres INTEGER — anything above this (~24.8
+ * days) is clamped rather than overflowing the write. */
+export const MAX_RESPONSE_TIME_MS = 2147483647;
+
+/**
+ * Normalizes a computed latency for response_time_ms: rounded to a whole
+ * ms, floored at 0 (clock skew between Redis's stream-id clock and this
+ * process can make a fresh row look a few ms "early"), and capped at
+ * MAX_RESPONSE_TIME_MS.
+ */
+export function toResponseTimeMs(ms: number): number {
+  if (!Number.isFinite(ms)) return 0;
+  return Math.min(MAX_RESPONSE_TIME_MS, Math.max(0, Math.round(ms)));
 }
 
 @Entity('notifications')
@@ -42,17 +91,26 @@ export class NotificationEntity {
   @CreateDateColumn({ name: 'created_at' })
   createdAt: Date;
 
-  @Column({ name: 'sent_at', type: 'timestamp', nullable: true })
-  sentAt: Date | null;
+  /**
+   * When the row last entered its current status — its insert time while
+   * `pending`, then the moment it became `sent`/`failed`/`cancelled`.
+   * Written by the application (never a DB default) so it shares one
+   * clock with response_time_ms's arithmetic; see NotificationsService.
+   */
+  @Column({ name: 'status_changed_at', type: 'timestamp' })
+  statusChangedAt: Date;
 
-  /** Null for `pending`/`sent` rows — only ever set alongside `failed`/`cancelled`. */
-  @Column({ type: 'text', nullable: true })
-  reason: NotificationReason | null;
+  /** Why the row is in its current status — see NotificationReason. */
+  @Column({ type: 'text' })
+  reason: NotificationReason;
 
-  /** End-to-end latency in ms — from the job's own jobs:notify timestamp to
-   * the moment this recipient's send resolved, the same number logged to
-   * the terminal (see logDelivery in telegram-dispatch.service.ts). Only
-   * ever set alongside `sent`; null otherwise. */
-  @Column({ name: 'response_time_ms', type: 'int', nullable: true })
-  responseTimeMs: number | null;
+  /**
+   * End-to-end latency in ms — from the job's own jobs:notify timestamp
+   * (its arrival) to this row's latest status change: arrival→insert while
+   * `pending`, arrival→send for `sent` (the same number logged to the
+   * terminal, see logDelivery in telegram-dispatch.service.ts), and
+   * arrival→failure/cancellation for `failed`/`cancelled`.
+   */
+  @Column({ name: 'response_time_ms', type: 'int' })
+  responseTimeMs: number;
 }

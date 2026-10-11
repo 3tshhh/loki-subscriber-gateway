@@ -1,6 +1,7 @@
-import { IsEnum, IsIn, IsInt, IsOptional } from 'class-validator';
+import { IsIn, IsInt, Min, ValidateIf } from 'class-validator';
 import {
-  NotificationReason,
+  NOTIFICATION_OUTCOME_REASONS,
+  type NotificationOutcomeReason,
   NotificationStatus,
 } from '../entities/notification.entity';
 
@@ -8,11 +9,15 @@ export class UpdateNotificationStatusDto {
   @IsIn(['sent', 'failed'])
   status: Extract<NotificationStatus, 'sent' | 'failed'>;
 
-  @IsOptional()
-  @IsEnum(NotificationReason)
-  reason?: NotificationReason;
+  /** Required for `failed` (which outcome caused it); ignored for `sent`,
+   * whose reason is always DELIVERED. */
+  @ValidateIf((dto: UpdateNotificationStatusDto) => dto.status === 'failed')
+  @IsIn(NOTIFICATION_OUTCOME_REASONS)
+  reason?: NotificationOutcomeReason;
 
-  @IsOptional()
+  /** Arrival in jobs:notify → this outcome, in ms — required for every
+   * status, since response_time_ms is never NULL. */
   @IsInt()
-  responseTimeMs?: number;
+  @Min(0)
+  responseTimeMs: number;
 }

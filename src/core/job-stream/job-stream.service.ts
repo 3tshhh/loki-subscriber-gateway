@@ -177,7 +177,11 @@ export class JobStreamService implements OnModuleInit, OnModuleDestroy {
       // to the telegram-bot module, so a crash between here and the XADD
       // below never loses the record of an intended delivery — a retry
       // picks the recorded pending recipients back up (see above).
-      await this.notifications.insertPendingForChats(jobId, chatIds);
+      await this.notifications.insertPendingForChats(
+        jobId,
+        chatIds,
+        enqueuedAtMs,
+      );
     }
 
     const categoryName = await this.getCategoryName(category);

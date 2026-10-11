@@ -1,6 +1,10 @@
 import { Body, Controller, Param, Patch } from '@nestjs/common';
-import { NotificationsService } from './notifications.service';
+import {
+  NotificationStatusChange,
+  NotificationsService,
+} from './notifications.service';
 import { UpdateNotificationStatusDto } from './dto/update-notification-status.dto';
+import { NotificationReason } from './entities/notification.entity';
 
 /**
  * Called by the telegram-bot module (over HTTP, never a direct import) to
@@ -16,19 +20,24 @@ export class NotificationsController {
     @Param('chatId') chatId: string,
     @Body() dto: UpdateNotificationStatusDto,
   ) {
-    await this.notifications.setStatus(
-      jobId,
-      chatId,
-      dto.status,
-      dto.reason ?? null,
-      dto.responseTimeMs ?? null,
-    );
+    // The DTO's @ValidateIf already guarantees a reason for `failed`; the
+    // non-null assertion just carries that guarantee into the type.
+    const change: NotificationStatusChange =
+      dto.status === 'sent'
+        ? { status: 'sent', responseTimeMs: dto.responseTimeMs }
+        : {
+            status: 'failed',
+            reason: dto.reason!,
+            responseTimeMs: dto.responseTimeMs,
+          };
+    await this.notifications.setStatus(jobId, chatId, change);
     return {
       jobId,
       chatId,
-      status: dto.status,
-      reason: dto.reason ?? null,
-      responseTimeMs: dto.responseTimeMs ?? null,
+      status: change.status,
+      reason:
+        change.status === 'sent' ? NotificationReason.DELIVERED : change.reason,
+      responseTimeMs: change.responseTimeMs,
     };
   }
 }

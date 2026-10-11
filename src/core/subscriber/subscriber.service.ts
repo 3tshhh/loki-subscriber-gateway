@@ -17,8 +17,10 @@ import { UserCategoryEntity } from './entities/user-category.entity';
 import { UserSourceEntity } from './entities/user-source.entity';
 import {
   NotificationEntity,
+  NotificationOutcomeReason,
   NotificationReason,
 } from '../notifications/entities/notification.entity';
+import { closePendingNotifications } from '../notifications/notifications.service';
 
 /** Hard-delete deactivated users after this long, per retention policy. */
 export const RETENTION_DAYS = 30;
@@ -449,7 +451,7 @@ export class SubscriberService implements OnModuleInit {
    */
   async deactivateUser(
     chatId: string,
-    reason: NotificationReason = NotificationReason.USER_UNSUBSCRIBED,
+    reason: NotificationOutcomeReason = NotificationReason.USER_UNSUBSCRIBED,
   ): Promise<boolean> {
     await this.redis.srem(REDIS_KEYS.activeUsers, chatId);
 
@@ -461,11 +463,16 @@ export class SubscriberService implements OnModuleInit {
       );
       if (!result.affected) return false; // never existed — nothing to cancel either
 
-      await manager.update(
-        NotificationEntity,
-        { chatId, status: 'pending' },
-        { status: 'cancelled', reason },
-      );
+      // Same bulk write as the dead-letter path: status_changed_at = now
+      // and response_time_ms = arrival→now for every row still pending.
+      await closePendingNotifications(
+        manager.createQueryBuilder().update(NotificationEntity),
+        'cancelled',
+        reason,
+      )
+        .where('chat_id = :chatId', { chatId })
+        .andWhere('status = :pending', { pending: 'pending' })
+        .execute();
       return true;
     });
   }

@@ -22,7 +22,10 @@ import {
 } from '../../shared/redis';
 import { BOT } from '../bot.provider';
 import { SubscriberService } from '../../core/subscriber/subscriber.service';
-import { NotificationsService } from '../../core/notifications/notifications.service';
+import {
+  NotificationStatusChange,
+  NotificationsService,
+} from '../../core/notifications/notifications.service';
 import { NotificationReason } from '../../core/notifications/entities/notification.entity';
 import { buildJobMessage, safeButtonUrl } from './message-builder';
 import {
@@ -203,12 +206,14 @@ export class TelegramDispatchService implements OnModuleInit, OnModuleDestroy {
         this.logger.warn(`Chat ${chatId} blocked the bot, deactivating`);
         // No send happened, but we're never retrying this recipient either
         // — keep the claim in place so a reclaim of this entry skips them.
-        await this.reportStatus(
-          jobId,
-          chatId,
-          'failed',
-          NotificationReason.BOT_BLOCKED,
-        );
+        // The failed row's response_time_ms is arrival→this 403, like a
+        // sent row's is arrival→send; deactivateUser below then cancels the
+        // chat's other pending rows with their own arrival→now.
+        await this.reportStatus(jobId, chatId, {
+          status: 'failed',
+          reason: NotificationReason.BOT_BLOCKED,
+          responseTimeMs: Date.now() - job.enqueuedAtMs,
+        });
         await this.subscriber.deactivateUser(
           chatId,
           NotificationReason.BOT_BLOCKED,
@@ -232,7 +237,10 @@ export class TelegramDispatchService implements OnModuleInit, OnModuleDestroy {
     // message the recipient already got. The claim was already made before
     // sending, so there's nothing left to record here.
     const endToEndMs = Date.now() - job.enqueuedAtMs;
-    await this.reportStatus(jobId, chatId, 'sent', null, endToEndMs);
+    await this.reportStatus(jobId, chatId, {
+      status: 'sent',
+      responseTimeMs: endToEndMs,
+    });
     this.logDelivery(job, chatId, true, endToEndMs);
   }
 
@@ -323,21 +331,13 @@ export class TelegramDispatchService implements OnModuleInit, OnModuleDestroy {
   private async reportStatus(
     jobId: string,
     chatId: string,
-    status: 'sent' | 'failed',
-    reason: NotificationReason | null = null,
-    responseTimeMs: number | null = null,
+    change: NotificationStatusChange,
   ): Promise<void> {
     try {
-      await this.notifications.setStatus(
-        jobId,
-        chatId,
-        status,
-        reason,
-        responseTimeMs,
-      );
+      await this.notifications.setStatus(jobId, chatId, change);
     } catch (err) {
       this.logger.error(
-        `Failed to report status=${status} for job ${jobId} chat ${chatId} to core: ${(err as Error).message}`,
+        `Failed to report status=${change.status} for job ${jobId} chat ${chatId} to core: ${(err as Error).message}`,
       );
     }
   }
