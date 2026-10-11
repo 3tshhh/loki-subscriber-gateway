@@ -108,6 +108,14 @@ export class SubscriberService {
    * The one write /start makes (and the "Resume" button) — an upsert in a
    * single statement, no prior read needed: creates the row on a genuinely
    * first-ever activation, or reactivates an existing one either way.
+   *
+   * `username` only ever overwrites a stored one when the caller actually
+   * has a value (COALESCE): ctx.from?.username is undefined for Telegram
+   * users without an @handle, and HTTP callers may omit it entirely —
+   * neither should wipe a handle we already know. The tradeoff is that a
+   * user who genuinely removes their Telegram handle keeps the stale one
+   * here until they set a new one; that's preferred over losing a known
+   * handle every time a caller simply doesn't pass it.
    */
   async activateUserUpsert(
     chatId: string,
@@ -116,7 +124,8 @@ export class SubscriberService {
     await this.dataSource.query(
       `INSERT INTO users (chat_id, active, deactivated_at, username)
        VALUES ($1, true, NULL, $2)
-       ON CONFLICT (chat_id) DO UPDATE SET active = true, deactivated_at = NULL, username = EXCLUDED.username`,
+       ON CONFLICT (chat_id) DO UPDATE SET active = true, deactivated_at = NULL,
+         username = COALESCE(EXCLUDED.username, users.username)`,
       [chatId, username ?? null],
     );
     await this.redis.sadd(REDIS_KEYS.activeUsers, chatId);
@@ -243,6 +252,18 @@ export class SubscriberService {
    * "If you select none, you'll receive jobs from all sources") —
    * job-stream.service.ts's matching query treats a user with no
    * user_sources rows exactly this way.
+   *
+   * A brand-new user created by this upsert is inserted as `active = true`
+   * — intended behavior: finishing the picker is as clear an opt-in as
+   * /start. An existing row's `active` flag is never touched here, though,
+   * so a deactivated user editing their picks stays deactivated until /start
+   * or "Resume". Note this path doesn't SADD to `users:active`, so a
+   * brand-new user created here is only picked up by dispatch once /start
+   * or "Resume" adds them to the set.
+   *
+   * `username` follows the same COALESCE rule as activateUserUpsert: a
+   * caller with no username never wipes a stored one (at the cost of a
+   * removed Telegram handle lingering until a new one is set).
    */
   async updateSubscriptions(
     chatId: string,
@@ -253,7 +274,8 @@ export class SubscriberService {
     await this.dataSource.transaction(async (manager) => {
       await manager.query(
         `INSERT INTO users (chat_id, active, username) VALUES ($1, true, $2)
-         ON CONFLICT (chat_id) DO UPDATE SET username = EXCLUDED.username`,
+         ON CONFLICT (chat_id) DO UPDATE
+         SET username = COALESCE(EXCLUDED.username, users.username)`,
         [chatId, username ?? null],
       );
       await manager.delete(UserCategoryEntity, { chatId });
