@@ -14,9 +14,11 @@ export class UserEntity {
   @Column({ default: true })
   active: boolean;
 
-  /** Telegram @username at the time of last /start or resume — nullable,
-   * since a user can have none set, and re-saved on every activation so it
-   * stays current if they change it later. */
+  /** Telegram @username as last seen on /start, "Resume" or "Done" —
+   * nullable, since a user can have none set. Updated whenever a new one
+   * comes in, but never cleared by a caller that has none (COALESCE in
+   * SubscriberService), so a handle the user later removes lingers until
+   * they set another. */
   @Column({ type: 'text', nullable: true })
   username: string | null;
 

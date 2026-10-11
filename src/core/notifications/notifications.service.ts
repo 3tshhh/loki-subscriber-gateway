@@ -77,12 +77,6 @@ export class NotificationsService {
     private readonly notifications: Repository<NotificationEntity>,
   ) {}
 
-  /** True if this job has already been fanned out to at least one user. */
-  async hasBeenProcessed(jobId: string): Promise<boolean> {
-    const count = await this.notifications.count({ where: { jobId } });
-    return count > 0;
-  }
-
   /**
    * Inserts one pending row per matched recipient, ignoring rows that
    * already exist so re-delivery of the same jobs:notify entry (via XCLAIM)

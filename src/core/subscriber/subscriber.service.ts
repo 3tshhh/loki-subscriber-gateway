@@ -408,11 +408,12 @@ export class SubscriberService implements OnModuleInit {
     sourceIds: string[],
     username?: string | null,
   ): Promise<{ categoryIds: string[]; sourceIds: string[] }> {
-    await this.dataSource.transaction(async (manager) => {
-      await manager.query(
+    const active = await this.dataSource.transaction(async (manager) => {
+      const rows: { active: boolean }[] = await manager.query(
         `INSERT INTO users (chat_id, active, username) VALUES ($1, true, $2)
          ON CONFLICT (chat_id) DO UPDATE
-         SET username = COALESCE(EXCLUDED.username, users.username)`,
+         SET username = COALESCE(EXCLUDED.username, users.username)
+         RETURNING active`,
         [chatId, username ?? null],
       );
       await manager.delete(UserCategoryEntity, { chatId });
@@ -429,7 +430,20 @@ export class SubscriberService implements OnModuleInit {
           sourceIds.map((sourceId) => ({ chatId, sourceId })),
         );
       }
+      return Boolean(rows[0]?.active);
     });
+
+    // A brand-new chat is inserted active above, so it must also join
+    // users:active — dispatch skips anyone missing from that set, and
+    // without this a chat that only ever used /categories or /sources
+    // would be active in Postgres yet silently receive nothing until the
+    // next restart's rebuildActiveUsersSet. Done after commit, and only
+    // for rows that are actually active, so an existing stopped user who
+    // edits their picks stays out of the set. SADD is idempotent, so an
+    // already-active user re-adding themselves is a harmless no-op.
+    if (active) {
+      await this.redis.sadd(REDIS_KEYS.activeUsers, chatId);
+    }
 
     return { categoryIds, sourceIds };
   }
