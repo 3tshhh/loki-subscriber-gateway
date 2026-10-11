@@ -100,7 +100,10 @@ export class JobStreamService implements OnModuleInit, OnModuleDestroy {
       entry.fields,
     );
     if (!jobId || !category || !source) {
+      // Dropped like an unusable payload below: deleted from
+      // jobs:delivering as well as acked, so it doesn't sit there forever.
       this.logger.warn(`Dropping malformed jobs:delivering entry ${entry.id}`);
+      await this.redis.xdel(REDIS_STREAMS.jobsDelivering, entry.id);
       return;
     }
 
