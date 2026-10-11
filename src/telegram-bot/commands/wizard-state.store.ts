@@ -1,5 +1,8 @@
 import { Injectable } from '@nestjs/common';
-import { CategoryDto, SourceDto } from '../bot-subscriber.service';
+import {
+  CategoryDto,
+  SourceDto,
+} from '../../core/subscriber/subscriber.service';
 
 export type WizardMode = 'wizard' | 'categories-only' | 'sources-only';
 

@@ -27,11 +27,10 @@ import { toggleId, WizardState, WizardStateStore } from './wizard-state.store';
  * WizardStateStore once fetched at bootstrap. Only "Done" writes anything,
  * via updateSubscriptions.
  *
- * Calls Core's own SubscriberService directly (in-process DI, no HTTP hop)
- * rather than the old BotSubscriberService raw-SQL duplicate — that class
- * is still fully registered in TelegramBotModule as a rollback path, so
- * reverting a call site here back to it is a one-line change. See
- * backup/*.ts.bak for earlier iterations of this file.
+ * Calls Core's own SubscriberService directly (in-process DI, no HTTP hop).
+ * The old BotSubscriberService raw-SQL duplicate it used to call has been
+ * deleted — git history is the rollback path if that ever needs undoing.
+ * See backup/*.ts.bak for earlier iterations of this file.
  */
 @Injectable()
 export class TelegramCommandsService implements OnModuleInit {

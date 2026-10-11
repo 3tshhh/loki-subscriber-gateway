@@ -1,5 +1,8 @@
 import { InlineKeyboard } from 'grammy';
-import { CategoryDto, SourceDto } from '../bot-subscriber.service';
+import {
+  CategoryDto,
+  SourceDto,
+} from '../../core/subscriber/subscriber.service';
 
 /**
  * Ported from the pre-split bot's user_bot.py: a staged wizard (categories
