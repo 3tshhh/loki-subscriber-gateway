@@ -50,8 +50,11 @@ export class StreamConsumer {
       batchSize?: number;
       claimIntervalMs?: number;
       minIdleTimeMs?: number;
-      /** Past this many delivery attempts, dead-letter instead of reclaim.
-       * Omit to reclaim forever (no dead-letter). */
+      /** Total deliveries an entry gets, counting the first read: once
+       * XPENDING reports a delivery count of at least this many (every one
+       * of them unacked), the entry is dead-lettered instead of reclaimed —
+       * so 5 means the first attempt plus 4 retries, never a 6th. Omit to
+       * reclaim forever (no dead-letter). */
       maxDeliveryAttempts?: number;
       /** Stream poison entries are moved to. Required if maxDeliveryAttempts
        * is set. */
@@ -294,7 +297,7 @@ export class StreamConsumer {
         const deliveryCount = Number(deliveryCountRaw);
         if (
           this.options.maxDeliveryAttempts !== undefined &&
-          deliveryCount > this.options.maxDeliveryAttempts
+          deliveryCount >= this.options.maxDeliveryAttempts
         ) {
           deadIds.push(id);
         } else {
@@ -352,7 +355,7 @@ export class StreamConsumer {
         '_deadLetteredFromId',
         id,
         '_reason',
-        `exceeded ${this.options.maxDeliveryAttempts} delivery attempts`,
+        `reached ${this.options.maxDeliveryAttempts} delivery attempts`,
         '_deadLetteredAt',
         String(Date.now()),
       );
@@ -361,7 +364,7 @@ export class StreamConsumer {
         await this.redis.xdel(this.stream, id);
       }
       this.logger.error(
-        `${this.stream}#${id} exceeded max delivery attempts, moved to ${this.options.deadLetterStream}`,
+        `${this.stream}#${id} reached max delivery attempts, moved to ${this.options.deadLetterStream}`,
       );
     }
   }

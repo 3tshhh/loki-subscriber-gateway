@@ -39,8 +39,9 @@ export enum NotificationReason {
    * written onto a row that's still `pending`, so a more specific reason
    * already recorded (user_unsubscribed, bot_blocked) is kept. */
   RECIPIENT_INACTIVE = 'recipient_inactive',
-  /** Exhausted MAX_DELIVERY_ATTEMPTS XCLAIM retries and was moved to the
-   * dead-letter stream without ever successfully sending. */
+  /** Used up all MAX_DELIVERY_ATTEMPTS deliveries of its notify:telegram
+   * entry and was moved to the dead-letter stream without ever
+   * successfully sending. */
   DELIVERY_RETRIES_EXHAUSTED = 'delivery_retries_exhausted',
   /** Job-level resume found the row still `pending` but older than
    * RESUME_WINDOW_SECONDS: an earlier notify:telegram entry may or may not

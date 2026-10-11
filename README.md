@@ -201,9 +201,9 @@ mechanisms — **not** for subscriber matching. Exact names live in
 | ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `jobs:notify`             | Inbound stream from the Python producer (`dispatch-group`)                                                                                                                               |
 | `jobs:delivering`         | Internal stream of jobs being matched/handed off (`delivering-group`)                                                                                                                    |
-| `jobs:delivering:dead`    | Dead-letter stream for `jobs:delivering` entries that exceeded `MAX_DELIVERY_ATTEMPTS`                                                                                                   |
+| `jobs:delivering:dead`    | Dead-letter stream for `jobs:delivering` entries that used up `MAX_DELIVERY_ATTEMPTS`                                                                                                    |
 | `notify:telegram`         | Internal stream of per-job send batches (`telegram-senders`)                                                                                                                             |
-| `notify:telegram:dead`    | Dead-letter stream for `notify:telegram` entries that exceeded `MAX_DELIVERY_ATTEMPTS`                                                                                                   |
+| `notify:telegram:dead`    | Dead-letter stream for `notify:telegram` entries that used up `MAX_DELIVERY_ATTEMPTS`                                                                                                    |
 | `users:active`            | Set of every currently-active chat_id; dispatch checks it before sending, closing the race where a user stops right after their job was queued (see below)                               |
 | `notif:delivered:{jobId}` | Per-job set of chat_ids already claimed (sent, being sent, permanently failed, or cancelled as inactive); guards retried/duplicated `notify:telegram` entries from re-sending. 7-day TTL |
 
@@ -285,8 +285,9 @@ can't compile.
   stream. A foreign consumer group on any of these streams is logged as a
   warning — it would be receiving its own full copy of every entry.
 - **Dead-lettering.** `jobs:delivering` and `notify:telegram` both cap
-  retries at `MAX_DELIVERY_ATTEMPTS` (5). An entry delivered more often than
-  that is copied to its dead-letter stream (`jobs:delivering:dead` /
+  deliveries at `MAX_DELIVERY_ATTEMPTS` (5 in total — the first attempt plus
+  4 retries). An entry that has been delivered that many times without
+  being acked is copied to its dead-letter stream (`jobs:delivering:dead` /
   `notify:telegram:dead`, with `_deadLetteredFromId`, `_reason`, `_deadLetteredAt`)
   and acked, instead of cycling through claim/fail/reclaim forever. For
   `notify:telegram`, the entry's still-`pending` recipients are marked

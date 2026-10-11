@@ -134,9 +134,9 @@ describe('StreamConsumer', () => {
       onDeadLetter,
     });
 
-    it('dead-letters entries over the delivery cap and reclaims the rest', async () => {
+    it('dead-letters entries that reached the delivery cap and reclaims the rest', async () => {
       redis.xpending.mockResolvedValueOnce(
-        pending(['1-0', 6], ['2-0', 5], ['3-0', 1]),
+        pending(['1-0', 5], ['2-0', 4], ['3-0', 1]),
       );
 
       await sweep(consumer(deadLetterOptions()));
@@ -151,7 +151,8 @@ describe('StreamConsumer', () => {
         50,
       );
 
-      // Over the cap: callback, copy to the dead stream, ack — never handled.
+      // Delivered 5 times already, cap 5: callback, copy to the dead
+      // stream, ack — never handed a 6th delivery.
       expect(onDeadLetter).toHaveBeenCalledTimes(1);
       expect(onDeadLetter).toHaveBeenCalledWith({ jobId: 'job-1-0' });
       expect(redis.xadd).toHaveBeenCalledTimes(1);
@@ -163,7 +164,7 @@ describe('StreamConsumer', () => {
         '_deadLetteredFromId',
         '1-0',
         '_reason',
-        'exceeded 5 delivery attempts',
+        'reached 5 delivery attempts',
         '_deadLetteredAt',
         expect.any(String),
       );
@@ -171,7 +172,7 @@ describe('StreamConsumer', () => {
       // Without deleteOnDeadLetter the original stays in the stream.
       expect(redis.xdel).not.toHaveBeenCalled();
 
-      // At or under the cap: claimed and run through the normal handler.
+      // Under the cap: claimed and run through the normal handler.
       expect(redis.xclaim).toHaveBeenCalledWith(
         STREAM,
         GROUP,
@@ -187,6 +188,15 @@ describe('StreamConsumer', () => {
       expect(redis.xack).toHaveBeenCalledWith(STREAM, GROUP, '2-0');
       expect(redis.xack).toHaveBeenCalledWith(STREAM, GROUP, '3-0');
       expect(handle.mock.calls.map(([entry]) => entry.id)).not.toContain('1-0');
+    });
+
+    it('dead-letters an entry delivered more than the cap too', async () => {
+      redis.xpending.mockResolvedValueOnce(pending(['1-0', 6]));
+
+      await sweep(consumer(deadLetterOptions()));
+
+      expect(redis.xadd).toHaveBeenCalledTimes(1);
+      expect(handle).not.toHaveBeenCalled();
     });
 
     it('still dead-letters an entry when the onDeadLetter callback fails', async () => {
@@ -219,7 +229,7 @@ describe('StreamConsumer', () => {
       });
 
       it('XDELs the entry by its own id only after the dead-letter XADD and the XACK', async () => {
-        redis.xpending.mockResolvedValueOnce(pending(['1-0', 6], ['3-0', 1]));
+        redis.xpending.mockResolvedValueOnce(pending(['1-0', 5], ['3-0', 1]));
 
         await sweep(consumer(deletingOptions()));
 
@@ -235,7 +245,7 @@ describe('StreamConsumer', () => {
       });
 
       it('neither acks nor deletes the entry when copying it to the dead-letter stream fails', async () => {
-        redis.xpending.mockResolvedValueOnce(pending(['1-0', 6]));
+        redis.xpending.mockResolvedValueOnce(pending(['1-0', 5]));
         redis.xadd.mockRejectedValue(new Error('OOM'));
 
         await expect(sweep(consumer(deletingOptions()))).rejects.toThrow('OOM');
@@ -245,7 +255,7 @@ describe('StreamConsumer', () => {
       });
 
       it('does not delete the entry when the XACK fails', async () => {
-        redis.xpending.mockResolvedValueOnce(pending(['1-0', 6]));
+        redis.xpending.mockResolvedValueOnce(pending(['1-0', 5]));
         redis.xack.mockRejectedValue(new Error('connection lost'));
 
         await expect(sweep(consumer(deletingOptions()))).rejects.toThrow(

@@ -45,7 +45,7 @@ export const REDIS_STREAMS = {
    * deletes it from here again once the handoff succeeds, so this only
    * ever holds what's genuinely in flight right now. */
   jobsDelivering: 'jobs:delivering',
-  /** jobs:delivering entries that exceeded MAX_DELIVERY_ATTEMPTS (e.g. one
+  /** jobs:delivering entries that used up MAX_DELIVERY_ATTEMPTS (e.g. one
    * that keeps failing because Postgres is unreachable for it) land here
    * instead of being reclaimed every sweep forever. Each is also deleted
    * from jobsDelivering (StreamConsumer's deleteOnDeadLetter, only once the
@@ -55,7 +55,7 @@ export const REDIS_STREAMS = {
    * jobsDelivering once the underlying problem is fixed. */
   jobsDeliveringDead: 'jobs:delivering:dead',
   notifyTelegram: 'notify:telegram',
-  /** Poison entries that exceeded MAX_DELIVERY_ATTEMPTS land here instead of
+  /** Poison entries that used up MAX_DELIVERY_ATTEMPTS land here instead of
    * cycling through claim/fail/reclaim forever. */
   notifyTelegramDead: 'notify:telegram:dead',
 };
@@ -68,8 +68,9 @@ export const CONSUMER_GROUPS = {
   telegramSenders: 'telegram-senders',
 };
 
-/** An entry claimed and failed more than this many times is dead-lettered
- * instead of reclaimed again. */
+/** Total deliveries an entry gets, the first read included: once it has
+ * been delivered this many times without being acked, it's dead-lettered
+ * instead of reclaimed again (5 → the first attempt plus 4 retries). */
 export const MAX_DELIVERY_ATTEMPTS = 5;
 
 /** Default cap on how much undelivered backlog a consumer group will
