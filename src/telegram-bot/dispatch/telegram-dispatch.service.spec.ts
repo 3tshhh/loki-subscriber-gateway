@@ -380,6 +380,54 @@ describe('TelegramDispatchService', () => {
       );
     });
 
+    it.each([
+      ['unparseable JSON', '[111,'],
+      ['a JSON object', '{"a":"111"}'],
+      ['an array of numbers', '[111, 222]'],
+      ['JSON null', 'null'],
+    ])(
+      'drops (acks) an entry whose chatIds is %s instead of throwing',
+      async (_label, chatIds) => {
+        await expect(
+          handle({ ...entry([]), fields: { ...entry([]).fields, chatIds } }),
+        ).resolves.toBeUndefined();
+        expect(redis.sismember).not.toHaveBeenCalled();
+        expect(sendMessage).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each([
+      ['unparseable JSON', '["Mobile",'],
+      ['a JSON string', '"Mobile"'],
+      ['an array of numbers', '[1, 2]'],
+    ])(
+      'still delivers, with the default tag, when categories is %s',
+      async (_label, categories) => {
+        const base = entry(['111']);
+
+        await expect(
+          handle({ ...base, fields: { ...base.fields, categories } }),
+        ).resolves.toBeUndefined();
+
+        expect(sendMessage).toHaveBeenCalledTimes(1);
+        const [, text] = sendMessage.mock.calls[0] as [string, string];
+        // Same as an empty list: tagged with the category's display name.
+        expect(text).toContain('#MobileAppDevelopment');
+      },
+    );
+
+    it('renders well-formed categories as hashtags', async () => {
+      const base = entry(['111']);
+
+      await handle({
+        ...base,
+        fields: { ...base.fields, categories: '["Mobile"]' },
+      });
+
+      const [, text] = sendMessage.mock.calls[0] as [string, string];
+      expect(text).toContain('#Mobile');
+    });
+
     it('drops an entry without jobId or chatIds', async () => {
       await expect(
         handle({ id: '1-0', fields: { jobId: JOB_ID } }),
@@ -399,6 +447,17 @@ describe('TelegramDispatchService', () => {
         JOB_ID,
         ['111', '222'],
       );
+    });
+
+    it('does nothing when the chatIds field is malformed', async () => {
+      await expect(
+        (service as unknown as DispatchInternals).handleDeadLetter({
+          jobId: JOB_ID,
+          chatIds: 'not json',
+        }),
+      ).resolves.toBeUndefined();
+
+      expect(notifications.markDeliveryRetriesExhausted).not.toHaveBeenCalled();
     });
   });
 });

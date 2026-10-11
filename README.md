@@ -312,7 +312,10 @@ can't compile.
   with no usable `jobId`/`category`/`source`, or whose `payload` isn't a JSON
   object, is logged and acked — retrying can't fix it, and throwing would
   only park it on the PEL until it's dead-lettered. Same for a
-  `notify:telegram` entry without `jobId`/`chatIds`.
+  `notify:telegram` entry without `jobId`/`chatIds`, or whose `chatIds`
+  isn't a JSON array of strings. A malformed `categories` on it only feeds
+  the hashtags, so it falls back to `[]` (the category-name tag) and the job
+  is still delivered.
 - **Job-level resume.** A crash can land between inserting a job's `pending`
   rows and its `notify:telegram` `XADD`. So when `JobStreamService` sees a
   job that already has rows, it doesn't simply skip it: if any rows are

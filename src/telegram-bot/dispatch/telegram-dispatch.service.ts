@@ -42,6 +42,26 @@ const MAX_RATE_LIMIT_ATTEMPTS = 3;
 
 type SendMessageOptions = NonNullable<Parameters<Bot['api']['sendMessage']>[2]>;
 
+/**
+ * Decodes a notify:telegram field that should hold a JSON array of strings
+ * (chatIds, categories), or null if it's anything else — unparseable JSON,
+ * or valid JSON of the wrong shape — so the caller decides what an
+ * unusable value means instead of a parse error throwing out of the
+ * handler and leaving the entry to be retried until it's dead-lettered.
+ */
+function parseStringArray(raw: string): string[] | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  return Array.isArray(parsed) &&
+    parsed.every((item) => typeof item === 'string')
+    ? parsed
+    : null;
+}
+
 interface NotifyTelegramFields {
   jobId: string;
   title: string;
@@ -118,7 +138,34 @@ export class TelegramDispatchService implements OnModuleInit, OnModuleDestroy {
       return;
     }
 
-    const recipients = JSON.parse(chatIds) as string[];
+    // Malformed recipients can never be delivered, and retrying won't
+    // change that — dropped (acked) right here, the same way
+    // JobStreamService drops an unusable jobs:delivering entry, rather
+    // than thrown and retried until it's dead-lettered.
+    const recipients = parseStringArray(chatIds);
+    if (!recipients) {
+      this.logger.warn(
+        `Dropping notify:telegram entry ${entry.id} (job ${jobId}): chatIds is not a JSON array of strings`,
+      );
+      return;
+    }
+
+    // categories only feeds the message's hashtags, so a malformed value
+    // just falls back to [] — exactly like an omitted one, which tags the
+    // message with its category name instead (see buildJobMessage). It's
+    // no reason to withhold a deliverable job.
+    let tags: string[] = [];
+    if (categories) {
+      const parsedCategories = parseStringArray(categories);
+      if (parsedCategories) {
+        tags = parsedCategories;
+      } else {
+        this.logger.warn(
+          `notify:telegram entry ${entry.id} (job ${jobId}): categories is not a JSON array of strings, sending with the default tag`,
+        );
+      }
+    }
+
     const job: NotifyTelegramFields = {
       jobId,
       title: title ?? '',
@@ -127,7 +174,7 @@ export class TelegramDispatchService implements OnModuleInit, OnModuleDestroy {
       category: category ?? '',
       categoryName: categoryName || category || '',
       source: source ?? '',
-      categories: categories ? (JSON.parse(categories) as string[]) : [],
+      categories: tags,
       enqueuedAtMs: enqueuedAt ? Number(enqueuedAt) : Date.now(),
     };
 
@@ -409,8 +456,9 @@ export class TelegramDispatchService implements OnModuleInit, OnModuleDestroy {
   ): Promise<void> {
     const { jobId, chatIds } = fields;
     if (!jobId || !chatIds) return;
+    const recipients = parseStringArray(chatIds);
+    if (!recipients) return;
     try {
-      const recipients = JSON.parse(chatIds) as string[];
       await this.notifications.markDeliveryRetriesExhausted(jobId, recipients);
     } catch (err) {
       this.logger.error(
