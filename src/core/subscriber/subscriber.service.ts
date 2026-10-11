@@ -393,10 +393,9 @@ export class SubscriberService implements OnModuleInit {
    * — intended behavior: finishing the picker is as clear an opt-in as
    * /start. An existing row's `active` flag is never touched here, though,
    * so a deactivated user editing their picks stays deactivated until /start
-   * or "Resume". Note this path doesn't SADD to `users:active`, so a
-   * brand-new user created here is only picked up by dispatch once /start
-   * or "Resume" adds them to the set, or the next startup's
-   * rebuildActiveUsersSet does.
+   * or "Resume". After the transaction commits, the chat is SADDed to
+   * `users:active` only if its row is active, so a brand-new user created
+   * here starts receiving jobs immediately, while a stopped one doesn't.
    *
    * `username` follows the same COALESCE rule as activateUserUpsert: a
    * caller with no username never wipes a stored one (at the cost of a

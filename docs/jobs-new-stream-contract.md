@@ -218,5 +218,7 @@ POST /sources       { "id": "upwork", "name": "Upwork" }
 stream's `category`/`source` against these ids by exact, case-sensitive
 string equality in Postgres, with no normalization on either side — keeping
 ids to one plain format means there's no case or whitespace variant for the
-producer to get subtly wrong. (The ids also appear verbatim in the bot's
-button callback data.) Returns 409 if the id already exists.
+producer to get subtly wrong. Ids are capped at 60 characters, because they
+also appear verbatim in the bot's button callback data (`cat:<id>` /
+`src:<id>`), which Telegram limits to 64 bytes. Returns 409 if the id
+already exists.

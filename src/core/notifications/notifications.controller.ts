@@ -7,8 +7,9 @@ import { UpdateNotificationStatusDto } from './dto/update-notification-status.dt
 import { NotificationReason } from './entities/notification.entity';
 
 /**
- * Called by the telegram-bot module (over HTTP, never a direct import) to
- * report the outcome of a delivery attempt.
+ * HTTP surface for reporting a delivery attempt's outcome. Nothing in this
+ * repo calls it any more — the telegram-bot module uses NotificationsService
+ * in-process — but it's kept for external callers and manual fixes.
  */
 @Controller('notifications')
 export class NotificationsController {
