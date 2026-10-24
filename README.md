@@ -151,7 +151,9 @@ jobs:notify ─► JobMoverService ─► jobs:delivering ─► JobStreamServic
    real work: normalizes the entry (see the contract doc for the producer
    shape it accepts), matches subscribers in Postgres, inserts one
    `pending` `notifications` row per recipient, and hands the job off as a
-   single `notify:telegram` entry carrying the recipient list. Only after
+   single `notify:telegram` entry carrying the recipient list plus the
+   category's and source's display names (`categoryName`, `sourceName`,
+   looked up from Postgres so messages never show a raw slug id). Only after
    that `XADD` succeeds is the entry `XDEL`ed from `jobs:delivering`, so
    that stream only ever holds what's genuinely in flight.
 3. **`TelegramDispatchService`** (`telegram-senders` on `notify:telegram`)
@@ -173,23 +175,33 @@ A direct Postgres query in `job-stream.service.ts`'s `findSubscribers`, run
 once per new job — no Redis involved:
 
 ```sql
-SELECT DISTINCT u.chat_id
+SELECT u.chat_id
 FROM users u
-JOIN user_categories uc ON uc.chat_id = u.chat_id AND uc.category_id = $1
 WHERE u.active = true
+  AND (
+    EXISTS (SELECT 1 FROM user_categories uc WHERE uc.chat_id = u.chat_id AND uc.category_id = $1)
+    OR NOT EXISTS (SELECT 1 FROM user_categories uc WHERE uc.chat_id = u.chat_id)
+  )
   AND (
     EXISTS (SELECT 1 FROM user_sources us WHERE us.chat_id = u.chat_id AND us.source_id = $2)
     OR NOT EXISTS (SELECT 1 FROM user_sources us WHERE us.chat_id = u.chat_id)
   )
 ```
 
-`$1`/`$2` are the job's `category`/`source` ids. The `EXISTS` branch catches
-users who picked that exact source; `NOT EXISTS` catches users with zero
-`user_sources` rows at all — the "any source" wildcard. `active = true`
-excludes deactivated users. Indexed by the `IndexUserCategoriesForMatching`
-migration (`user_categories.category_id` — the table's only other index is
-the composite PK `(chat_id, category_id)`, which doesn't help a
-category-only filter).
+`$1`/`$2` are the job's `category`/`source` ids. Both dimensions match the
+same way: the `EXISTS` branch catches users who picked that exact
+category/source; `NOT EXISTS` catches users with zero rows on that side at
+all — the "any category" / "any source" wildcard. A user with no picks on
+either side therefore receives every job. `active = true` excludes
+deactivated users. The query is one pass over active users: Postgres
+typically resolves "picked this category" once through the
+`IndexUserCategoriesForMatching` index (`user_categories.category_id`) into
+a hashed set, and the "picked none" checks through the composite PKs
+`(chat_id, category_id)` / `(chat_id, source_id)`. Because users with no
+categories have no `user_categories` rows, they can't be found from that
+index, so it can't drive the query the way it drove the older
+category-required join. In benchmarks this single pass still beat
+`UNION`-based alternatives that start from the index.
 
 ## Redis structures
 
@@ -378,7 +390,7 @@ exception — they're the actual, live way to add a new category or source.
 | ------ | ------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | POST   | `/users/:chatId`                | `ensureUser` — creates the row (active) if missing, never reactivates an existing one _(unused)_                                                                       |
 | POST   | `/users/:chatId/activate`       | Explicit activation, 404 if the user doesn't exist _(unused)_                                                                                                          |
-| POST   | `/users/:chatId/bootstrap`      | `{ activate?, username? }` — optional activate-upsert, then current selection + enabled lists in one call _(unused)_                                                   |
+| POST   | `/users/:chatId/bootstrap`      | `{ activate?, username? }` — optional activate-upsert, then `active`, `registered`, current selection + enabled lists in one call _(unused)_                           |
 | GET    | `/categories`                   | Enabled categories _(unused)_                                                                                                                                          |
 | POST   | `/categories`                   | **Add a new category** — `{ id, name }`, id must be `^[a-z0-9_]+$`, at most 60 chars and not `done` (reserved for the picker's Done button), 409 if it already exists  |
 | GET    | `/sources`                      | Enabled sources _(unused)_                                                                                                                                             |
@@ -434,15 +446,19 @@ categoryIds, sourceIds, username)` write, followed by a combined review
   **source** picker (a separate screen, not shown alongside categories)
   without saving yet. The source picker's own "Done" is what actually
   finalizes (the combined write + review above).
-- Picking **zero sources means "any source"**: the source screen says so
-  explicitly ("If you select none, you'll receive jobs from all sources"),
-  and it's a real matching-semantics difference, not just UI wording — see
-  "Subscriber matching" above (the `NOT EXISTS` branch).
-- While inactive, the category/source pickers show a notice plus a
+- Picking **zero categories means "any category"** and **zero sources means
+  "any source"**: both screens say so explicitly ("If you select none,
+  you'll receive jobs from all ..."), and it's a real matching-semantics
+  difference, not just UI wording — see "Subscriber matching" above (the
+  `NOT EXISTS` branches). A user who saves with nothing picked on either
+  screen gets every job.
+- While stopped (a users row with `active = false`), the category/source
+  pickers show a notice plus a
   "▶️ Resume notifications" button (`reactivate:cat` / `reactivate:src`
   callback data — a distinct top-level prefix so it can never collide with
   a real category/source id) so a stopped user can resume without retyping
-  `/start`.
+  `/start`. A chat with no users row yet isn't treated as stopped: it gets
+  the plain picker, and its first Done creates it active.
 - **`/stop`**: soft-deactivates — removed from `users:active`,
   `active=false`, `deactivated_at=now()` — but `user_categories`/
   `user_sources` rows are kept (matching already excludes inactive users) so

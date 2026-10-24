@@ -219,7 +219,10 @@ export class JobStreamService implements OnModuleInit, OnModuleDestroy {
       );
     }
 
-    const categoryName = await this.getCategoryName(category);
+    const { categoryName, sourceName } = await this.getDisplayNames(
+      category,
+      source,
+    );
 
     await this.redis.xadd(
       REDIS_STREAMS.notifyTelegram,
@@ -240,6 +243,8 @@ export class JobStreamService implements OnModuleInit, OnModuleDestroy {
       categoryName ?? category,
       'source',
       source,
+      'sourceName',
+      sourceName ?? source,
       'chatIds',
       JSON.stringify(chatIds),
       'enqueuedAt',
@@ -357,36 +362,53 @@ export class JobStreamService implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * The category's presentable display name (e.g. 'mobile_app' -> 'Mobile
-   * App Development'), for the outbound message header — the id itself is
-   * a routing slug, never meant to be shown to a subscriber. Falls back to
-   * the id if the category was deleted after this job was matched against
-   * it (row still exists in the seed data in practice, but matching isn't
-   * contingent on the display name existing).
+   * The category's and source's presentable display names (e.g.
+   * 'mobile_app' -> 'Mobile App Development', 'linkedin' -> 'LinkedIn'),
+   * for the outbound message's header and Platform line — the ids
+   * themselves are routing slugs, never meant to be shown to a subscriber.
+   * One round trip for both. Either is null if its row doesn't exist (e.g.
+   * deleted after this job was matched), and the caller falls back to the
+   * id — matching isn't contingent on a display name existing.
    */
-  private async getCategoryName(categoryId: string): Promise<string | null> {
-    const rows: { name: string }[] = await this.dataSource.query(
-      `SELECT name FROM categories WHERE id = $1`,
-      [categoryId],
-    );
-    return rows[0]?.name ?? null;
+  private async getDisplayNames(
+    categoryId: string,
+    sourceId: string,
+  ): Promise<{ categoryName: string | null; sourceName: string | null }> {
+    const rows: { category_name: string | null; source_name: string | null }[] =
+      await this.dataSource.query(
+        `SELECT (SELECT name FROM categories WHERE id = $1) AS category_name,
+                (SELECT name FROM sources WHERE id = $2) AS source_name`,
+        [categoryId, sourceId],
+      );
+    return {
+      categoryName: rows[0]?.category_name ?? null,
+      sourceName: rows[0]?.source_name ?? null,
+    };
   }
 
   /**
-   * Active subscribers for this exact category+source pairing, plus active
-   * subscribers who picked the category but zero sources (accepts "any
-   * source"). Runs directly against Postgres — see
-   * IndexUserCategoriesForMatching migration for why that's indexed.
+   * Active subscribers matching this job on both dimensions, where each
+   * dimension matches the same way: the user picked this exact id, or
+   * picked none at all on that side ("any category" / "any source"). So a
+   * user with zero picks on both sides receives every job. Runs directly
+   * against Postgres as one pass over active users: the planner typically
+   * resolves the "picked this category" check once, via the
+   * IndexUserCategoriesForMatching index, into a hashed set, and the "picked
+   * none" checks through the (chat_id, ...) primary keys. Benchmarked
+   * faster than UNION-based alternatives that drive from the index.
    */
   private async findSubscribers(
     categoryId: string,
     sourceId: string,
   ): Promise<string[]> {
     const rows: { chat_id: string }[] = await this.dataSource.query(
-      `SELECT DISTINCT u.chat_id
+      `SELECT u.chat_id
        FROM users u
-       JOIN user_categories uc ON uc.chat_id = u.chat_id AND uc.category_id = $1
        WHERE u.active = true
+         AND (
+           EXISTS (SELECT 1 FROM user_categories uc WHERE uc.chat_id = u.chat_id AND uc.category_id = $1)
+           OR NOT EXISTS (SELECT 1 FROM user_categories uc WHERE uc.chat_id = u.chat_id)
+         )
          AND (
            EXISTS (SELECT 1 FROM user_sources us WHERE us.chat_id = u.chat_id AND us.source_id = $2)
            OR NOT EXISTS (SELECT 1 FROM user_sources us WHERE us.chat_id = u.chat_id)

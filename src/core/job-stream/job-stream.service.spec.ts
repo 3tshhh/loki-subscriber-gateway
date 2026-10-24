@@ -50,7 +50,7 @@ describe('JobStreamService', () => {
   /** Rows the mocked Postgres hands back, keyed by which table is queried. */
   let recordedRows: { chat_id: string; status: string; resumable: boolean }[];
   let subscriberRows: { chat_id: string }[];
-  let categoryRows: { name: string }[];
+  let nameRows: { category_name: string | null; source_name: string | null }[];
 
   beforeAll(() => {
     Logger.overrideLogger(false);
@@ -59,7 +59,9 @@ describe('JobStreamService', () => {
   beforeEach(() => {
     recordedRows = [];
     subscriberRows = [];
-    categoryRows = [{ name: 'Mobile App Development' }];
+    nameRows = [
+      { category_name: 'Mobile App Development', source_name: 'Upwork' },
+    ];
 
     redis = {
       xadd: jest.fn().mockResolvedValue('1700000000001-0'),
@@ -69,8 +71,7 @@ describe('JobStreamService', () => {
       query: jest.fn((sql: string) => {
         if (sql.includes('FROM notifications'))
           return Promise.resolve(recordedRows);
-        if (sql.includes('FROM categories'))
-          return Promise.resolve(categoryRows);
+        if (sql.includes('FROM categories')) return Promise.resolve(nameRows);
         if (sql.includes('FROM users')) return Promise.resolve(subscriberRows);
         return Promise.reject(new Error(`unexpected query: ${sql}`));
       }),
@@ -297,6 +298,7 @@ describe('JobStreamService', () => {
         category: 'mobile_app',
         categoryName: 'Mobile App Development',
         source: 'upwork',
+        sourceName: 'Upwork',
         chatIds: JSON.stringify(['111', '222']),
         enqueuedAt: String(ORIGINAL_MS),
       });
@@ -329,11 +331,24 @@ describe('JobStreamService', () => {
 
     it('falls back to the category id when the category has no display name', async () => {
       subscriberRows = [{ chat_id: '111' }];
-      categoryRows = [];
+      nameRows = [{ category_name: null, source_name: 'Upwork' }];
 
       await handle(contractEntry());
 
       expect(notifyFields().categoryName).toBe('mobile_app');
+      expect(notifyFields().sourceName).toBe('Upwork');
+    });
+
+    it('falls back to the source id when the source has no display name', async () => {
+      subscriberRows = [{ chat_id: '111' }];
+      nameRows = [
+        { category_name: 'Mobile App Development', source_name: null },
+      ];
+
+      await handle(contractEntry());
+
+      expect(notifyFields().sourceName).toBe('upwork');
+      expect(notifyFields().categoryName).toBe('Mobile App Development');
     });
 
     it('re-hands off a partially processed job only to its still-pending recipients, without re-matching', async () => {

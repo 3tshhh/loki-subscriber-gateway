@@ -43,7 +43,7 @@ describe('buildJobMessage', () => {
   ): JobMessageParams => ({
     title: 'Build an app',
     description: 'Flutter work',
-    source: 'upwork',
+    sourceName: 'Upwork',
     categoryName: 'Mobile App Development',
     categories: ['Mobile', 'Cross Platform'],
     url: 'https://s.example.com/abc',
@@ -56,7 +56,7 @@ describe('buildJobMessage', () => {
 
     expect(message).toContain('<b>New Mobile App Development Opportunity</b>');
     expect(message).toContain('<b>Build an app</b>');
-    expect(message).toContain('<b>Platform</b>\nupwork');
+    expect(message).toContain('<b>Platform</b>\nUpwork');
     expect(message).toContain('<b>Description</b>\n\nFlutter work');
     expect(message).toContain('#Mobile #CrossPlatform');
   });
@@ -66,7 +66,7 @@ describe('buildJobMessage', () => {
       params({
         title: '<script>alert("x")</script>',
         description: "Tom & Jerry's <b>deal</b>",
-        source: 'a<b',
+        sourceName: 'a<b',
         categoryName: 'R&D',
         categories: ['C<>'],
       }),

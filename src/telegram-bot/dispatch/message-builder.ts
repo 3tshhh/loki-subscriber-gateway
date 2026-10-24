@@ -100,7 +100,10 @@ function safeHtmlTruncate(html: string, limit: number): string {
 export interface JobMessageParams {
   title: string;
   description?: string;
-  source: string;
+  /** The source's presentable display name (e.g. 'LinkedIn'), resolved
+   * from the sources table — shown on the Platform line instead of the
+   * routing slug id ('linkedin'). */
+  sourceName: string;
   /**
    * The category's presentable display name (e.g. 'Backend Development'),
    * resolved from the categories table against the routing slug id — this
@@ -131,7 +134,7 @@ export function buildJobMessage(params: JobMessageParams): string {
 
   let header = `🚀 <b>New ${escapeHtml(displayCategory)} Opportunity</b>\n\n`;
   header += `📄 <b>${escapeHtml(params.title)}</b>\n`;
-  header += `🏢 <b>Platform</b>\n${escapeHtml(params.source)}`;
+  header += `🏢 <b>Platform</b>\n${escapeHtml(params.sourceName)}`;
 
   const sections: string[] = [];
 

@@ -73,6 +73,9 @@ interface NotifyTelegramFields {
    * routing slug and is never shown to a subscriber. */
   categoryName: string;
   source: string;
+  /** The source's presentable display name (e.g. 'LinkedIn'), used for the
+   * message's Platform line — 'source' above is the routing slug. */
+  sourceName: string;
   categories: string[];
   /** The original jobs:notify entry's own timestamp (ms since epoch) — lets
    * dispatch compute true end-to-end latency, not just its own processing
@@ -129,6 +132,7 @@ export class TelegramDispatchService implements OnModuleInit, OnModuleDestroy {
       category,
       categoryName,
       source,
+      sourceName,
       categories,
       chatIds,
       enqueuedAt,
@@ -174,6 +178,8 @@ export class TelegramDispatchService implements OnModuleInit, OnModuleDestroy {
       category: category ?? '',
       categoryName: categoryName || category || '',
       source: source ?? '',
+      // Entries queued before sourceName existed fall back to the id.
+      sourceName: sourceName || source || '',
       categories: tags,
       enqueuedAtMs: enqueuedAt ? Number(enqueuedAt) : Date.now(),
     };
@@ -230,7 +236,7 @@ export class TelegramDispatchService implements OnModuleInit, OnModuleDestroy {
     const text = buildJobMessage({
       title: job.title,
       description: job.description,
-      source: job.source,
+      sourceName: job.sourceName,
       categoryName: job.categoryName,
       categories: job.categories,
       url: job.link,

@@ -48,6 +48,7 @@ type DeliverableJob = {
   category: string;
   categoryName: string;
   source: string;
+  sourceName: string;
   categories: string[];
   enqueuedAtMs: number;
 };
@@ -138,6 +139,7 @@ describe('TelegramDispatchService', () => {
     category: 'mobile_app',
     categoryName: 'Mobile App Development',
     source: 'upwork',
+    sourceName: 'Upwork',
     categories: ['Mobile'],
     enqueuedAtMs: NOW - 1500,
     ...overrides,
@@ -168,6 +170,7 @@ describe('TelegramDispatchService', () => {
       ];
       expect(chatId).toBe(CHAT_ID);
       expect(text).toContain('Build an app');
+      expect(text).toContain('<b>Platform</b>\nUpwork');
       expect(options.parse_mode).toBe('HTML');
       expect(JSON.stringify(options.reply_markup)).toContain(
         'https://s.example.com/abc?userId=111',
@@ -360,6 +363,7 @@ describe('TelegramDispatchService', () => {
         category: 'mobile_app',
         categoryName: 'Mobile App Development',
         source: 'upwork',
+        sourceName: 'Upwork',
         chatIds: JSON.stringify(chatIds),
         enqueuedAt: String(NOW - 1500),
       },
@@ -426,6 +430,24 @@ describe('TelegramDispatchService', () => {
 
       const [, text] = sendMessage.mock.calls[0] as [string, string];
       expect(text).toContain('#Mobile');
+    });
+
+    it('renders the source display name on the Platform line', async () => {
+      await handle(entry(['111']));
+
+      const [, text] = sendMessage.mock.calls[0] as [string, string];
+      expect(text).toContain('<b>Platform</b>\nUpwork');
+    });
+
+    it('falls back to the source id for an entry queued without sourceName', async () => {
+      const base = entry(['111']);
+      const fields = { ...base.fields };
+      delete fields.sourceName;
+
+      await handle({ ...base, fields });
+
+      const [, text] = sendMessage.mock.calls[0] as [string, string];
+      expect(text).toContain('<b>Platform</b>\nupwork');
     });
 
     it('drops an entry without jobId or chatIds', async () => {

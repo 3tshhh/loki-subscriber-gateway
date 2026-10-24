@@ -49,7 +49,7 @@ export function categoryCaption(inactive: boolean): string {
   return (
     (inactive ? INACTIVE_NOTICE : '') +
     'Choose the job categories you want to receive.\n\n' +
-    'You can select more than one.'
+    "You can select more than one. If you select none, you'll receive jobs from all categories."
   );
 }
 
@@ -97,7 +97,7 @@ export function reviewMessage(
   const categoryLine =
     categoryNames.length > 0
       ? `📂 Categories:\n${categoryNames.map((name) => `• ${name}`).join('\n')}`
-      : "📂 Categories: none selected — you won't receive any notifications until you pick at least one.";
+      : '📂 Categories: all categories';
 
   const sourceNames = sources
     .filter((s) => selectedSourceIds.includes(s.id))

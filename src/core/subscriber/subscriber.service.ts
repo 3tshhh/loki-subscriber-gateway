@@ -55,6 +55,10 @@ export interface SourceDto {
 
 export interface BootstrapSnapshot {
   active: boolean;
+  /** Whether this chat has a users row at all. A chat without one isn't
+   * "stopped" — it just hasn't saved anything yet, and its first save
+   * (updateSubscriptions) creates it active. */
+  registered: boolean;
   categoryIds: string[];
   sourceIds: string[];
   categories: CategoryDto[];
@@ -62,9 +66,9 @@ export interface BootstrapSnapshot {
 }
 
 interface SnapshotRow {
-  kind: 'category' | 'source';
-  id: string;
-  name: string;
+  kind: 'user' | 'category' | 'source';
+  id: string | null;
+  name: string | null;
   selected: boolean;
   active: boolean | null;
 }
@@ -269,31 +273,35 @@ export class SubscriberService implements OnModuleInit {
 
   /**
    * Everything /start, /categories, /sources need to render their first
-   * screen, in exactly one SELECT (a CTE for this chat's active state,
-   * UNION ALL'd across categories and sources, each LEFT JOINed against
-   * this chat's picks). Works identically whether or not chat_id has a
-   * users row yet — a brand new chat just comes back with active=false and
-   * every selected flag false — and this method never writes anything.
+   * screen, in exactly one SELECT: one 'user' row carrying this chat's
+   * active flag (always present — the scalar subquery yields NULL when
+   * there's no users row), UNION ALL'd with every enabled category and
+   * source, each LEFT JOINed against this chat's picks. Because the 'user'
+   * row is always there, active/registered come out right even when no
+   * category or source is enabled. A brand new chat comes back with
+   * registered=false, active=false and every selected flag false, and this
+   * method never writes anything.
    */
   async getBootstrapSnapshot(chatId: string): Promise<BootstrapSnapshot> {
     const rows: SnapshotRow[] = await this.dataSource.query(
-      `WITH target_user AS (
-         SELECT active FROM users WHERE chat_id = $1
-       )
+      `SELECT 'user' AS kind, NULL::text AS id, NULL::text AS name,
+              false AS selected,
+              (SELECT active FROM users WHERE chat_id = $1) AS active
+
+       UNION ALL
+
        SELECT 'category' AS kind, c.id, c.name,
-              (uc.chat_id IS NOT NULL) AS selected, u.active
+              (uc.chat_id IS NOT NULL) AS selected, NULL AS active
        FROM categories c
        LEFT JOIN user_categories uc ON uc.category_id = c.id AND uc.chat_id = $1
-       LEFT JOIN target_user u ON true
        WHERE c.enabled = true
 
        UNION ALL
 
        SELECT 'source' AS kind, s.id, s.name,
-              (us.chat_id IS NOT NULL) AS selected, u.active
+              (us.chat_id IS NOT NULL) AS selected, NULL AS active
        FROM sources s
        LEFT JOIN user_sources us ON us.source_id = s.id AND us.chat_id = $1
-       LEFT JOIN target_user u ON true
        WHERE s.enabled = true
 
        ORDER BY kind, name`,
@@ -305,19 +313,26 @@ export class SubscriberService implements OnModuleInit {
     const categoryIds: string[] = [];
     const sourceIds: string[] = [];
     let active = false;
+    let registered = false;
 
     for (const row of rows) {
-      active = Boolean(row.active);
+      if (row.kind === 'user') {
+        registered = row.active !== null;
+        active = Boolean(row.active);
+        continue;
+      }
+      const id = row.id!;
+      const name = row.name!;
       if (row.kind === 'category') {
-        categories.push({ id: row.id, name: row.name, enabled: true });
-        if (row.selected) categoryIds.push(row.id);
+        categories.push({ id, name, enabled: true });
+        if (row.selected) categoryIds.push(id);
       } else {
-        sources.push({ id: row.id, name: row.name, enabled: true });
-        if (row.selected) sourceIds.push(row.id);
+        sources.push({ id, name, enabled: true });
+        if (row.selected) sourceIds.push(id);
       }
     }
 
-    return { active, categoryIds, sourceIds, categories, sources };
+    return { active, registered, categoryIds, sourceIds, categories, sources };
   }
 
   /**
@@ -383,11 +398,11 @@ export class SubscriberService implements OnModuleInit {
    * Replaces the user's category/source selection in Postgres. Upserts the
    * user row first so this works even for a chat whose only interaction so
    * far was /categories or /sources (never /start) — those are pure reads
-   * and never create the row themselves. Picking zero sources means "any
-   * source" for each picked category (mirrors the pre-split bot's picker:
-   * "If you select none, you'll receive jobs from all sources") —
-   * job-stream.service.ts's matching query treats a user with no
-   * user_sources rows exactly this way.
+   * and never create the row themselves. Picking zero categories means "any
+   * category" and zero sources "any source" (the pickers say so: "If you
+   * select none, you'll receive jobs from all ...") — job-stream.service.ts's
+   * matching query treats a user with no user_categories / user_sources
+   * rows exactly this way, so zero picks on both sides means every job.
    *
    * A brand-new user created by this upsert is inserted as `active = true`
    * — intended behavior: finishing the picker is as clear an opt-in as

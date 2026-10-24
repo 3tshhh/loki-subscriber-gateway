@@ -196,6 +196,86 @@ describe('SubscriberService', () => {
     });
   });
 
+  describe('getBootstrapSnapshot', () => {
+    const userRow = (active: boolean | null) => ({
+      kind: 'user',
+      id: null,
+      name: null,
+      selected: false,
+      active,
+    });
+
+    it('splits rows into lists and picks, reading state from the user row', async () => {
+      dataSource.query.mockResolvedValue([
+        {
+          kind: 'category',
+          id: 'mobile_app',
+          name: 'Mobile',
+          selected: true,
+          active: null,
+        },
+        {
+          kind: 'category',
+          id: 'web_dev',
+          name: 'Web',
+          selected: false,
+          active: null,
+        },
+        {
+          kind: 'source',
+          id: 'upwork',
+          name: 'Upwork',
+          selected: true,
+          active: null,
+        },
+        userRow(true),
+      ]);
+
+      await expect(service.getBootstrapSnapshot('111')).resolves.toEqual({
+        active: true,
+        registered: true,
+        categoryIds: ['mobile_app'],
+        sourceIds: ['upwork'],
+        categories: [
+          { id: 'mobile_app', name: 'Mobile', enabled: true },
+          { id: 'web_dev', name: 'Web', enabled: true },
+        ],
+        sources: [{ id: 'upwork', name: 'Upwork', enabled: true }],
+      });
+    });
+
+    it('reports a chat with no users row as unregistered, not stopped', async () => {
+      dataSource.query.mockResolvedValue([userRow(null)]);
+
+      const snapshot = await service.getBootstrapSnapshot('111');
+
+      expect(snapshot.registered).toBe(false);
+      expect(snapshot.active).toBe(false);
+    });
+
+    it('reports a stopped user as registered and inactive', async () => {
+      dataSource.query.mockResolvedValue([userRow(false)]);
+
+      const snapshot = await service.getBootstrapSnapshot('111');
+
+      expect(snapshot.registered).toBe(true);
+      expect(snapshot.active).toBe(false);
+    });
+
+    it('keeps an active user active when nothing is enabled', async () => {
+      dataSource.query.mockResolvedValue([userRow(true)]);
+
+      const snapshot = await service.getBootstrapSnapshot('111');
+
+      expect(snapshot).toMatchObject({
+        active: true,
+        registered: true,
+        categories: [],
+        sources: [],
+      });
+    });
+  });
+
   describe('rebuildActiveUsersSet', () => {
     const activeRows = (count: number) =>
       Array.from({ length: count }, (_, i) => ({ chat_id: 1000 + i }));

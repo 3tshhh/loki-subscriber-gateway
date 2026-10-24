@@ -1,7 +1,10 @@
 import { Inject, Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { Bot, Context, GrammyError } from 'grammy';
 import { BOT } from '../bot.provider';
-import { SubscriberService } from '../../core/subscriber/subscriber.service';
+import {
+  BootstrapSnapshot,
+  SubscriberService,
+} from '../../core/subscriber/subscriber.service';
 import { NotificationReason } from '../../core/notifications/entities/notification.entity';
 import {
   CATEGORIES_DONE_CALLBACK,
@@ -15,6 +18,16 @@ import {
   sourceKeyboard,
 } from './selector.util';
 import { toggleId, WizardState, WizardStateStore } from './wizard-state.store';
+
+/**
+ * Only a chat that has a users row and is inactive gets the "unsubscribed"
+ * notice and Resume button. A chat with no row yet was never stopped — its
+ * first Done creates it active — so telling it it's unsubscribed would be
+ * wrong.
+ */
+function isStopped(snapshot: BootstrapSnapshot): boolean {
+  return snapshot.registered && !snapshot.active;
+}
 
 /**
  * Reads and writes are deliberately split for UX, not just performance:
@@ -132,11 +145,12 @@ export class TelegramCommandsService implements OnModuleInit {
       sources: snapshot.sources,
       mode: 'categories-only',
     });
-    await ctx.reply(categoryCaption(!snapshot.active), {
+    const inactive = isStopped(snapshot);
+    await ctx.reply(categoryCaption(inactive), {
       reply_markup: categoryKeyboard(
         snapshot.categories,
         snapshot.categoryIds,
-        !snapshot.active,
+        inactive,
       ),
     });
   }
@@ -152,11 +166,12 @@ export class TelegramCommandsService implements OnModuleInit {
       sources: snapshot.sources,
       mode: 'sources-only',
     });
-    await ctx.reply(sourceCaption(!snapshot.active), {
+    const inactive = isStopped(snapshot);
+    await ctx.reply(sourceCaption(inactive), {
       reply_markup: sourceKeyboard(
         snapshot.sources,
         snapshot.sourceIds,
-        !snapshot.active,
+        inactive,
       ),
     });
   }
