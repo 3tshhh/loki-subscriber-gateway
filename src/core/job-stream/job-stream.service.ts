@@ -10,8 +10,8 @@ import { ConfigService } from '@nestjs/config';
 import type Redis from 'ioredis';
 import { DataSource } from 'typeorm';
 import {
+  backlogLimitsFromConfig,
   CONSUMER_GROUPS,
-  DEFAULT_STARTUP_BACKLOG_CAP,
   MAX_DELIVERY_ATTEMPTS,
   REDIS_CLIENT,
   REDIS_STREAMS,
@@ -21,6 +21,11 @@ import {
   streamEntryTimestampMs,
 } from '../../shared/redis';
 import { colorDuration, colorModule } from '../../shared/logging/colors';
+import {
+  formatChatIds,
+  streamRef,
+  trace,
+} from '../../shared/logging/pipeline-trace';
 import { NotificationsService } from '../notifications/notifications.service';
 
 /**
@@ -55,10 +60,7 @@ export class JobStreamService implements OnModuleInit, OnModuleDestroy {
   }
 
   async onModuleInit() {
-    const backlogCap = Number(
-      this.config.get<string>('JOB_STREAM_BACKLOG_CAP') ??
-        DEFAULT_STARTUP_BACKLOG_CAP,
-    );
+    const { cap: backlogCap, maxAgeMs } = backlogLimitsFromConfig(this.config);
 
     this.consumer = new StreamConsumer(
       this.redis,
@@ -68,6 +70,7 @@ export class JobStreamService implements OnModuleInit, OnModuleDestroy {
       (entry) => this.handleJob(entry),
       {
         maxBacklogOnStartup: backlogCap,
+        maxBacklogAgeMs: maxAgeMs,
         // Without a cap, an entry whose handling keeps throwing (Postgres
         // unreachable for it, a bug tripped by one specific payload, ...)
         // would be reclaimed and re-failed on every pending-entries sweep
@@ -108,10 +111,28 @@ export class JobStreamService implements OnModuleInit, OnModuleDestroy {
     const { jobId, category, source, payload } = this.normalizeEntry(
       entry.fields,
     );
+    const entryRef = streamRef(REDIS_STREAMS.jobsDelivering, entry.id);
+    trace('MATCH', 'received', {
+      job: jobId ?? '?',
+      entry: entryRef,
+      category,
+      source,
+      waited: `${Date.now() - enqueuedAtMs}ms`,
+    });
     if (!jobId || !category || !source) {
       // Dropped like an unusable payload below: deleted from
       // jobs:delivering as well as acked, so it doesn't sit there forever.
-      this.logger.warn(`Dropping malformed jobs:delivering entry ${entry.id}`);
+      trace(
+        'MATCH',
+        'dropped',
+        {
+          job: jobId ?? '?',
+          entry: entryRef,
+          reason: 'malformed (no jobId/category/source)',
+          fields: Object.keys(entry.fields).join(','),
+        },
+        'warn',
+      );
       await this.redis.xdel(REDIS_STREAMS.jobsDelivering, entry.id);
       return;
     }
@@ -123,8 +144,15 @@ export class JobStreamService implements OnModuleInit, OnModuleDestroy {
     // again on every sweep until it's dead-lettered.
     const parsedPayload = this.parsePayload(payload);
     if (!parsedPayload) {
-      this.logger.warn(
-        `Dropping jobs:delivering entry ${entry.id} (job ${jobId}): payload is not a valid JSON object`,
+      trace(
+        'MATCH',
+        'dropped',
+        {
+          job: jobId,
+          entry: entryRef,
+          reason: 'payload is not a valid JSON object',
+        },
+        'warn',
       );
       await this.redis.xdel(REDIS_STREAMS.jobsDelivering, entry.id);
       return;
@@ -185,28 +213,57 @@ export class JobStreamService implements OnModuleInit, OnModuleDestroy {
         .filter((row) => !row.resumable)
         .map((row) => row.chat_id);
       if (stale.length > 0) {
-        this.logger.warn(
-          `Job ${jobId} has ${stale.length} recipient(s) pending for longer than the ${RESUME_WINDOW_SECONDS}s resume window — marking them failed (delivery status unknown) instead of risking a resend`,
+        trace(
+          'MATCH',
+          'stale',
+          {
+            job: jobId,
+            recipients: stale.length,
+            chats: formatChatIds(stale),
+            reason: `pending longer than the ${RESUME_WINDOW_SECONDS}s resume window, marked failed (delivery_status_unknown) instead of risking a resend`,
+          },
+          'warn',
         );
         await this.notifications.markDeliveryStatusUnknown(jobId, stale);
       }
       if (chatIds.length === 0) {
-        this.logger.debug(`Job ${jobId} already fully processed, skipping`);
+        trace('MATCH', 'skipped', {
+          job: jobId,
+          entry: entryRef,
+          reason: 'already fully processed',
+          recorded: recorded.length,
+        });
         await this.redis.xdel(REDIS_STREAMS.jobsDelivering, entry.id);
         return;
       }
-      this.logger.log(
-        `Job ${jobId} was already partially processed — re-handing off to its ${chatIds.length} still-pending recipient(s)`,
-      );
+      trace('MATCH', 'resumed', {
+        job: jobId,
+        recipients: chatIds.length,
+        chats: formatChatIds(chatIds),
+        recorded: recorded.length,
+        reason:
+          'already partially processed, re-handing off to still-pending recipients',
+      });
     } else {
       chatIds = await this.findSubscribers(category, source);
       if (chatIds.length === 0) {
-        this.logger.debug(
-          `Job ${jobId} (${category}/${source}) has no subscribers`,
-        );
+        trace('MATCH', 'no-match', {
+          job: jobId,
+          entry: entryRef,
+          category,
+          source,
+          reason: 'no active subscribers for this category/source',
+        });
         await this.redis.xdel(REDIS_STREAMS.jobsDelivering, entry.id);
         return;
       }
+      trace('MATCH', 'matched', {
+        job: jobId,
+        category,
+        source,
+        recipients: chatIds.length,
+        chats: formatChatIds(chatIds),
+      });
 
       // Persist who is supposed to receive this job before handing it off
       // to the telegram-bot module, so a crash between here and the XADD
@@ -224,7 +281,7 @@ export class JobStreamService implements OnModuleInit, OnModuleDestroy {
       source,
     );
 
-    await this.redis.xadd(
+    const handoffId = await this.redis.xadd(
       REDIS_STREAMS.notifyTelegram,
       '*',
       'jobId',
@@ -254,6 +311,13 @@ export class JobStreamService implements OnModuleInit, OnModuleDestroy {
     // Fully handed off — jobs:delivering should only ever hold what's
     // genuinely still in flight, not a permanent history.
     await this.redis.xdel(REDIS_STREAMS.jobsDelivering, entry.id);
+
+    trace('MATCH', 'handed-off', {
+      job: jobId,
+      from: entryRef,
+      to: streamRef(REDIS_STREAMS.notifyTelegram, String(handoffId)),
+      recipients: chatIds.length,
+    });
 
     if (this.loggingEnabled) {
       const processingMs = Number(process.hrtime.bigint() - start) / 1_000_000;

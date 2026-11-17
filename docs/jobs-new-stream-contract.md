@@ -25,13 +25,15 @@ to create the stream or the group** — a plain `XADD jobs:notify * ...` against
 a stream that doesn't exist yet will create it, and this repo's consumer
 will pick it up on its next poll regardless of which side got there first.
 
-On startup, if either internal stage (`jobs:notify` or `jobs:delivering`)
-finds more than `JOB_STREAM_BACKLOG_CAP` (default 250) entries undelivered to
-its group — e.g. after an unusually long outage — the oldest excess is
-dropped (deleted, never processed) and only the newest `JOB_STREAM_BACKLOG_CAP`
-are handled, so an extreme backlog can't flood subscribers with stale
-notifications all at once. Doesn't affect the Python side at all — it's
-purely how this repo's own consumers treat their own backlog.
+On startup — e.g. after an unusually long outage — entries still waiting on
+`jobs:notify` that are older than `JOB_STREAM_MAX_AGE_MINUTES` (default 60)
+are dropped (deleted, never processed), and of the rest only the newest
+`JOB_STREAM_BACKLOG_CAP` (default 250, shared with the internal
+`jobs:delivering` stage) are handled, so a backlog can't flood subscribers
+with stale notifications. Age is taken from the entry id this repo sees, i.e.
+when the producer `XADD`ed it. Doesn't affect the Python side at all — it's
+purely how this repo's own consumers treat their own backlog (see the
+README's "Startup backlog limits").
 
 ## Entry format
 

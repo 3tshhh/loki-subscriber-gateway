@@ -78,3 +78,9 @@ export const MAX_DELIVERY_ATTEMPTS = 5;
  * processing — see StreamConsumer's maxBacklogOnStartup option. Overridable
  * via the JOB_STREAM_BACKLOG_CAP env var. */
 export const DEFAULT_STARTUP_BACKLOG_CAP = 250;
+
+/** Default age (minutes) past which an undelivered entry is dropped on
+ * startup instead of processed — see StreamConsumer's maxBacklogAgeMs
+ * option. Overridable via the JOB_STREAM_MAX_AGE_MINUTES env var (0
+ * disables the age check). */
+export const DEFAULT_STARTUP_BACKLOG_MAX_AGE_MINUTES = 60;

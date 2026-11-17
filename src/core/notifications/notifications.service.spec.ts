@@ -322,6 +322,40 @@ describe('NotificationsService', () => {
     });
   });
 
+  describe('markBacklogDropped', () => {
+    it('closes only still-pending rows as cancelled / backlog_dropped with every status column filled', async () => {
+      await service.markBacklogDropped('job-1', ['111', '222']);
+
+      const values = (qb.set.mock.calls as unknown[][])[0][0] as Record<
+        string,
+        unknown
+      >;
+      expectAllStatusColumnsFilled(values);
+      expect(values).toEqual({
+        status: 'cancelled',
+        reason: NotificationReason.BACKLOG_DROPPED,
+        statusChangedAt: new Date(NOW),
+        responseTimeMs: expect.any(Function) as unknown,
+      });
+      expect(qb.where).toHaveBeenCalledWith('job_id = :jobId', {
+        jobId: 'job-1',
+      });
+      expect(qb.andWhere).toHaveBeenCalledWith('chat_id IN (:...chatIds)', {
+        chatIds: ['111', '222'],
+      });
+      expect(qb.andWhere).toHaveBeenCalledWith('status = :pending', {
+        pending: 'pending',
+      });
+      expect(qb.execute).toHaveBeenCalled();
+    });
+
+    it('does nothing for an empty recipient list', async () => {
+      await service.markBacklogDropped('job-1', []);
+
+      expect(repo.createQueryBuilder).not.toHaveBeenCalled();
+    });
+  });
+
   describe('closePendingNotifications', () => {
     it('computes response_time_ms in SQL as arrival-to-now, clamped to the INTEGER range', () => {
       const now = new Date(NOW);

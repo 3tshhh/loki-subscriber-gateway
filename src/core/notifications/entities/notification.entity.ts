@@ -49,6 +49,11 @@ export enum NotificationReason {
    * tell (and stop a resend) may already have expired. Rather than risk a
    * duplicate, the row is marked `failed` and the job not resent to them. */
   DELIVERY_STATUS_UNKNOWN = 'delivery_status_unknown',
+  /** Its notify:telegram batch was still waiting to be sent when the
+   * process restarted, and the startup backlog check dropped it instead —
+   * older than JOB_STREAM_MAX_AGE_MINUTES, or past JOB_STREAM_BACKLOG_CAP.
+   * Nothing was sent; the row is `cancelled`. */
+  BACKLOG_DROPPED = 'backlog_dropped',
   /** Backfill-only (FillAllNotificationColumns migration): a `failed`/
    * `cancelled` row written before the `reason` column existed, whose real
    * cause was never recorded. Used instead of guessing one; application
@@ -67,7 +72,8 @@ export type NotificationOutcomeReason =
   | NotificationReason.USER_UNSUBSCRIBED
   | NotificationReason.RECIPIENT_INACTIVE
   | NotificationReason.DELIVERY_RETRIES_EXHAUSTED
-  | NotificationReason.DELIVERY_STATUS_UNKNOWN;
+  | NotificationReason.DELIVERY_STATUS_UNKNOWN
+  | NotificationReason.BACKLOG_DROPPED;
 
 /** Every NotificationOutcomeReason value, for runtime validation (DTOs). */
 export const NOTIFICATION_OUTCOME_REASONS: readonly NotificationOutcomeReason[] =
@@ -77,6 +83,7 @@ export const NOTIFICATION_OUTCOME_REASONS: readonly NotificationOutcomeReason[] 
     NotificationReason.RECIPIENT_INACTIVE,
     NotificationReason.DELIVERY_RETRIES_EXHAUSTED,
     NotificationReason.DELIVERY_STATUS_UNKNOWN,
+    NotificationReason.BACKLOG_DROPPED,
   ];
 
 /** response_time_ms is a Postgres INTEGER — anything above this (~24.8

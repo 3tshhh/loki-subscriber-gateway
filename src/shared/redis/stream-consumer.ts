@@ -1,5 +1,6 @@
 import { Logger } from '@nestjs/common';
 import type Redis from 'ioredis';
+import { streamRef, trace } from '../logging/pipeline-trace';
 
 export type StreamEntry = { id: string; fields: Record<string, string> };
 
@@ -21,6 +22,69 @@ function fieldsToObject(flat: string[]): Record<string, string> {
     obj[flat[i]] = flat[i + 1];
   }
   return obj;
+}
+
+/** Entries read (and deleted) per round trip when dropping startup
+ * backlog — keeps memory and XDEL's argument list bounded however large
+ * the backlog is. */
+const BACKLOG_DROP_PAGE_SIZE = 500;
+
+/** Upper bound for the startup summary's "still to process" count. */
+const STARTUP_COUNT_LIMIT = 10_000;
+
+/** A job id for trace lines, from either producer shape. */
+function jobIdOf(fields: Record<string, string>): string {
+  return fields.jobId ?? fields['Job UUID'] ?? '?';
+}
+
+/** The group's last-delivered-id, or null if the group isn't on the
+ * stream. Throws (ERR no such key) if the stream itself doesn't exist. */
+async function lastDeliveredIdOf(
+  redis: Redis,
+  stream: string,
+  group: string,
+): Promise<string | null> {
+  const groups = (await redis.xinfo('GROUPS', stream)) as string[][];
+  const mine = groups.find((g) => g[g.indexOf('name') + 1] === group);
+  return mine ? mine[mine.indexOf('last-delivered-id') + 1] : null;
+}
+
+/**
+ * How many entries are waiting to be delivered to `group` (after its
+ * last-delivered-id), counting at most `max` — enough for a caller sizing
+ * its own budget against it without reading the whole stream. With
+ * `newerThanMs`, entries older than that are left out of the count (they're
+ * about to be dropped by that stream's own age check anyway). A missing
+ * stream or group counts as 0.
+ */
+export async function countUndelivered(
+  redis: Redis,
+  stream: string,
+  group: string,
+  max: number,
+  newerThanMs?: number,
+): Promise<number> {
+  if (max <= 0) return 0;
+
+  let lastDeliveredId: string | null;
+  try {
+    lastDeliveredId = await lastDeliveredIdOf(redis, stream, group);
+  } catch (err) {
+    if ((err as Error).message.includes('no such key')) return 0;
+    throw err;
+  }
+  if (lastDeliveredId === null) return 0;
+
+  const min =
+    newerThanMs !== undefined &&
+    streamEntryTimestampMs(lastDeliveredId) < newerThanMs
+      ? `${newerThanMs}-0`
+      : `(${lastDeliveredId}`;
+  const newest = (await redis.xrevrange(stream, '+', min, 'COUNT', max)) as [
+    string,
+    string[],
+  ][];
+  return newest.length;
 }
 
 /**
@@ -79,11 +143,23 @@ export class StreamConsumer {
       /** Caps how much undelivered backlog this group is handed on startup.
        * If more than this many entries piled up after this group's
        * last-delivered-id while nothing was consuming, the oldest excess is
-       * treated as too stale to be worth processing: the group's cursor is
-       * fast-forwarded past them (so they're never delivered) and they're
-       * deleted from the stream outright, keeping only the newest N. Omit
-       * to always process the full backlog, however large. */
-      maxBacklogOnStartup?: number;
+       * treated as too stale to be worth processing and deleted from the
+       * stream outright (so it's never delivered), keeping only the newest
+       * N. A function is evaluated once, at that startup check — for a
+       * caller whose budget depends on another stream's state (see
+       * JobMoverService). Omit to always process the full backlog, however
+       * large. Applied after maxBacklogAgeMs. */
+      maxBacklogOnStartup?: number | (() => Promise<number>);
+      /** On startup, deletes every undelivered entry older than this (by its
+       * stream id's timestamp — when it was XADD'd), however few there
+       * are: a job that sat out a long outage is stale whether 5 or 5,000
+       * of them piled up. Omit to keep entries of any age. */
+      maxBacklogAgeMs?: number;
+      /** Called once per entry, with its fields, right before the startup
+       * backlog check deletes it (by age or by count) — lets a caller close
+       * out its own domain records for work that will now never happen.
+       * Failures are logged and swallowed; they never block the drop. */
+      onBacklogDropped?: (fields: Record<string, string>) => Promise<void>;
     } = {},
   ) {
     this.logger = new Logger(`StreamConsumer:${stream}`);
@@ -177,44 +253,143 @@ export class StreamConsumer {
   }
 
   /**
-   * Runs once per (re)start, before the normal read loop — never mid-run,
-   * since it fast-forwards the group's own cursor and that would race
-   * with entries the loop is already about to read. Only ever fires when
-   * this group's backlog (everything after its last-delivered-id) exceeds
-   * maxBacklogOnStartup; a healthy catch-up after an ordinary restart is
-   * always well under that and this is a no-op.
+   * Runs once per (re)start, before the normal read loop. Only ever looks
+   * at this group's undelivered backlog (everything after its
+   * last-delivered-id) — never the PEL, whose entries were already handed
+   * to a consumer and are resumed by sweepPending instead. Two passes:
+   * first everything older than maxBacklogAgeMs, then, of what's left,
+   * everything but the newest maxBacklogOnStartup. A healthy catch-up after
+   * an ordinary restart hits neither and this is a no-op.
+   *
+   * Both passes walk the stream in fixed-size pages (the count pass finds
+   * its boundary with one bounded XREVRANGE), so a backlog of millions of
+   * entries after a very long outage is never loaded into memory or passed
+   * to a single XDEL at once. Dropped entries are simply deleted: the
+   * group's cursor doesn't need moving, since XREADGROUP only delivers
+   * entries that still exist — and deleting page by page means a crash
+   * midway leaves nothing half-done, just less left for the next start.
    */
   private async capBacklogOnStartup(): Promise<void> {
-    const cap = this.options.maxBacklogOnStartup;
-    if (cap === undefined) return;
+    const { maxBacklogOnStartup, maxBacklogAgeMs } = this.options;
+    if (maxBacklogOnStartup === undefined && maxBacklogAgeMs === undefined) {
+      return;
+    }
 
-    const groups = (await this.redis.xinfo(
-      'GROUPS',
+    const lastDeliveredId = await lastDeliveredIdOf(
+      this.redis,
       this.stream,
-    )) as string[][];
-    const mine = groups.find((g) => g[g.indexOf('name') + 1] === this.group);
-    if (!mine) return;
-
-    const lastDeliveredId = mine[mine.indexOf('last-delivered-id') + 1];
-
-    const backlog = (await this.redis.xrange(
-      this.stream,
-      `(${lastDeliveredId}`,
-      '+',
-    )) as unknown as [string, string[]][];
-
-    if (backlog.length <= cap) return;
-
-    const skipCount = backlog.length - cap;
-    const skippedIds = backlog.slice(0, skipCount).map(([id]) => id);
-    const cursorId = skippedIds[skippedIds.length - 1];
-
-    await this.redis.xgroup('SETID', this.stream, this.group, cursorId);
-    await this.redis.xdel(this.stream, ...skippedIds);
-
-    this.logger.warn(
-      `${this.stream}/${this.group} backlog was ${backlog.length}, exceeding the ${cap} cap — dropped the oldest ${skipCount} entries and kept only the newest ${cap}.`,
+      this.group,
     );
+    if (lastDeliveredId === null) return;
+    const afterCursor = `(${lastDeliveredId}`;
+
+    let expired = 0;
+    if (maxBacklogAgeMs !== undefined) {
+      const cutoffMs = Date.now() - maxBacklogAgeMs;
+      if (cutoffMs > 0) {
+        expired = await this.dropRange(afterCursor, `(${cutoffMs}-0`);
+      }
+    }
+
+    let overCap = 0;
+    let cap: number | undefined;
+    if (maxBacklogOnStartup !== undefined) {
+      const raw =
+        typeof maxBacklogOnStartup === 'function'
+          ? await maxBacklogOnStartup()
+          : maxBacklogOnStartup;
+      if (Number.isFinite(raw)) {
+        cap = Math.max(0, Math.floor(raw));
+        // The (cap+1)-th newest undelivered entry, if there is one, is the
+        // newest one to drop — it and everything older than it go.
+        const newest = (await this.redis.xrevrange(
+          this.stream,
+          '+',
+          afterCursor,
+          'COUNT',
+          cap + 1,
+        )) as unknown as [string, string[]][];
+        if (newest.length > cap) {
+          overCap = await this.dropRange(
+            afterCursor,
+            newest[newest.length - 1][0],
+          );
+        }
+      }
+    }
+
+    // One summary line per stream per start, even when nothing was dropped
+    // — after an outage this is the answer to "how much is about to go
+    // out". The remaining count is bounded so it stays one cheap call.
+    const remaining = await countUndelivered(
+      this.redis,
+      this.stream,
+      this.group,
+      STARTUP_COUNT_LIMIT,
+    ).catch(() => undefined);
+    trace(
+      'STARTUP',
+      'backlog',
+      {
+        stream: this.stream,
+        group: this.group,
+        cursor: lastDeliveredId,
+        expired,
+        maxAge:
+          maxBacklogAgeMs === undefined
+            ? 'off'
+            : `${Math.round(maxBacklogAgeMs / 60_000)}min`,
+        overCap,
+        cap: cap ?? 'off',
+        toProcess:
+          remaining === undefined
+            ? '?'
+            : remaining >= STARTUP_COUNT_LIMIT
+              ? `>=${STARTUP_COUNT_LIMIT}`
+              : remaining,
+      },
+      expired > 0 || overCap > 0 ? 'warn' : 'log',
+    );
+  }
+
+  /** Deletes every entry in [start, end] (XRANGE bounds, so `(` makes
+   * either side exclusive), a page at a time, running onBacklogDropped on
+   * each first. Returns how many were deleted. */
+  private async dropRange(start: string, end: string): Promise<number> {
+    let from = start;
+    let total = 0;
+
+    for (;;) {
+      const page = (await this.redis.xrange(
+        this.stream,
+        from,
+        end,
+        'COUNT',
+        BACKLOG_DROP_PAGE_SIZE,
+      )) as unknown as [string, string[]][];
+      if (page.length === 0) break;
+
+      if (this.options.onBacklogDropped) {
+        for (const [id, flat] of page) {
+          await this.options
+            .onBacklogDropped(fieldsToObject(flat))
+            .catch((err: Error) =>
+              this.logger.error(
+                `onBacklogDropped callback failed for ${this.stream}#${id}: ${err.message}`,
+                err.stack,
+              ),
+            );
+        }
+      }
+
+      await this.redis.xdel(this.stream, ...page.map(([id]) => id));
+      total += page.length;
+
+      if (page.length < BACKLOG_DROP_PAGE_SIZE) break;
+      from = `(${page[page.length - 1][0]}`;
+    }
+
+    return total;
   }
 
   private async readLoop(): Promise<void> {
@@ -363,8 +538,16 @@ export class StreamConsumer {
       if (this.options.deleteOnDeadLetter) {
         await this.redis.xdel(this.stream, id);
       }
-      this.logger.error(
-        `${this.stream}#${id} reached max delivery attempts, moved to ${this.options.deadLetterStream}`,
+      trace(
+        'PEL',
+        'dead',
+        {
+          job: jobIdOf(fields),
+          from: streamRef(this.stream, id),
+          to: this.options.deadLetterStream,
+          reason: `reached ${this.options.maxDeliveryAttempts} delivery attempts`,
+        },
+        'error',
       );
     }
   }
@@ -381,6 +564,16 @@ export class StreamConsumer {
     )) as unknown as [string, string[]][];
 
     for (const [id, flat] of claimed) {
+      trace(
+        'PEL',
+        'reclaimed',
+        {
+          job: jobIdOf(fieldsToObject(flat)),
+          entry: streamRef(this.stream, id),
+          reason: 'left unacked by an earlier attempt, retrying',
+        },
+        'warn',
+      );
       await this.processEntry(id, flat);
     }
   }

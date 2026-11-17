@@ -58,6 +58,7 @@ type DispatchInternals = {
   deliverOne(job: DeliverableJob, chatId: string): Promise<void>;
   handleNotification(entry: StreamEntry): Promise<void>;
   handleDeadLetter(fields: Record<string, string>): Promise<void>;
+  handleBacklogDropped(fields: Record<string, string>): Promise<void>;
 };
 
 describe('TelegramDispatchService', () => {
@@ -77,6 +78,7 @@ describe('TelegramDispatchService', () => {
     setStatus: jest.Mock;
     closeIfPending: jest.Mock;
     markDeliveryRetriesExhausted: jest.Mock;
+    markBacklogDropped: jest.Mock;
   };
   let service: TelegramDispatchService;
 
@@ -107,6 +109,7 @@ describe('TelegramDispatchService', () => {
       setStatus: jest.fn().mockResolvedValue(undefined),
       closeIfPending: jest.fn().mockResolvedValue(true),
       markDeliveryRetriesExhausted: jest.fn().mockResolvedValue(undefined),
+      markBacklogDropped: jest.fn().mockResolvedValue(undefined),
     };
     const config = {
       get: jest.fn((key: string) =>
@@ -374,6 +377,43 @@ describe('TelegramDispatchService', () => {
       expect(sendMessage).toHaveBeenCalledTimes(2);
     });
 
+    it('logs a per-batch summary of who got what', async () => {
+      const log = jest.spyOn(Logger.prototype, 'log');
+      // 111 active and sent, 222 inactive (cancelled), 333 already handled.
+      redis.sismember.mockImplementation((_key: string, chatId: string) =>
+        Promise.resolve(chatId === '222' ? 0 : 1),
+      );
+      pipeline.exec
+        .mockResolvedValueOnce([
+          [null, 1],
+          [null, 1],
+        ])
+        .mockResolvedValueOnce([
+          [null, 1],
+          [null, 1],
+        ])
+        .mockResolvedValueOnce([
+          [null, 0],
+          [null, 1],
+        ]);
+
+      try {
+        await handle(entry(['111', '222', '333']));
+
+        const lines = log.mock.calls.map(([msg]) => String(msg));
+        const done = lines.find((l) => l.startsWith('DISPATCH done'));
+        expect(done).toContain(`job=${JOB_ID}`);
+        expect(done).toContain('recipients=3');
+        expect(done).toContain('sent=1');
+        expect(done).toContain('inactive=1');
+        expect(done).toContain('skipped=1');
+        expect(done).toContain('failed=0');
+        expect(done).toContain('next=acked');
+      } finally {
+        log.mockRestore();
+      }
+    });
+
     it('rethrows so the entry stays unacked when any recipient failed transiently', async () => {
       sendMessage
         .mockResolvedValueOnce({ message_id: 1 })
@@ -480,6 +520,29 @@ describe('TelegramDispatchService', () => {
       ).resolves.toBeUndefined();
 
       expect(notifications.markDeliveryRetriesExhausted).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('handleBacklogDropped', () => {
+    it("cancels the dropped batch's recipients as backlog-dropped", async () => {
+      await (service as unknown as DispatchInternals).handleBacklogDropped({
+        jobId: JOB_ID,
+        chatIds: JSON.stringify(['111', '222']),
+      });
+
+      expect(notifications.markBacklogDropped).toHaveBeenCalledWith(JOB_ID, [
+        '111',
+        '222',
+      ]);
+    });
+
+    it('does nothing when the chatIds field is malformed', async () => {
+      await (service as unknown as DispatchInternals).handleBacklogDropped({
+        jobId: JOB_ID,
+        chatIds: '{"nope":1}',
+      });
+
+      expect(notifications.markBacklogDropped).not.toHaveBeenCalled();
     });
   });
 });

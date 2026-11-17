@@ -207,4 +207,23 @@ export class NotificationsService {
       .andWhere('status = :pending', { pending: 'pending' })
       .execute();
   }
+
+  /**
+   * Bulk write for a never-sent notify:telegram batch the startup backlog
+   * check dropped (see NotificationReason.BACKLOG_DROPPED). Same shape as
+   * markDeliveryRetriesExhausted, but `cancelled`: nothing was attempted,
+   * it was deliberately skipped.
+   */
+  async markBacklogDropped(jobId: string, chatIds: string[]): Promise<void> {
+    if (chatIds.length === 0) return;
+    await closePendingNotifications(
+      this.notifications.createQueryBuilder().update(),
+      'cancelled',
+      NotificationReason.BACKLOG_DROPPED,
+    )
+      .where('job_id = :jobId', { jobId })
+      .andWhere('chat_id IN (:...chatIds)', { chatIds })
+      .andWhere('status = :pending', { pending: 'pending' })
+      .execute();
+  }
 }

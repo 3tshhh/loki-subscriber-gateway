@@ -1,6 +1,10 @@
 import { Logger } from '@nestjs/common';
 import type Redis from 'ioredis';
-import { StreamConsumer, StreamEntry } from './stream-consumer';
+import {
+  countUndelivered,
+  StreamConsumer,
+  StreamEntry,
+} from './stream-consumer';
 
 const STREAM = 'jobs:delivering';
 const GROUP = 'delivering-group';
@@ -16,6 +20,7 @@ describe('StreamConsumer', () => {
   let redis: {
     xinfo: jest.Mock;
     xrange: jest.Mock;
+    xrevrange: jest.Mock;
     xgroup: jest.Mock;
     xdel: jest.Mock;
     xpending: jest.Mock;
@@ -34,6 +39,7 @@ describe('StreamConsumer', () => {
     redis = {
       xinfo: jest.fn(),
       xrange: jest.fn(),
+      xrevrange: jest.fn(),
       xgroup: jest.fn().mockResolvedValue('OK'),
       xdel: jest.fn().mockResolvedValue(1),
       xpending: jest.fn().mockResolvedValue([]),
@@ -84,26 +90,180 @@ describe('StreamConsumer', () => {
       expect(redis.xgroup).not.toHaveBeenCalled();
     });
 
+    /** Serves XRANGE/XREVRANGE from an in-memory stream, honouring
+     * exclusive `(` bounds and COUNT — so paging is exercised for real. */
+    const serveStream = (entries: [string, string[]][]) => {
+      const cmp = (a: string, b: string) => {
+        const [am, as] = a.split('-').map(Number);
+        const [bm, bs] = b.split('-').map(Number);
+        return am - bm || as - bs;
+      };
+      const within = (id: string, lo: string, hi: string) => {
+        const loOk =
+          lo === '-' ||
+          (lo.startsWith('(') ? cmp(id, lo.slice(1)) > 0 : cmp(id, lo) >= 0);
+        const hiOk =
+          hi === '+' ||
+          (hi.startsWith('(') ? cmp(id, hi.slice(1)) < 0 : cmp(id, hi) <= 0);
+        return loOk && hiOk;
+      };
+      redis.xrange.mockImplementation(
+        (_s: string, lo: string, hi: string, _c: string, count: number) =>
+          Promise.resolve(
+            entries.filter(([id]) => within(id, lo, hi)).slice(0, count),
+          ),
+      );
+      redis.xrevrange.mockImplementation(
+        (_s: string, hi: string, lo: string, _c: string, count: number) =>
+          Promise.resolve(
+            entries
+              .filter(([id]) => within(id, lo, hi))
+              .reverse()
+              .slice(0, count),
+          ),
+      );
+    };
+    const deletedIds = () =>
+      (redis.xdel.mock.calls as string[][]).flatMap((args) => args.slice(1));
+
     it('does nothing when the backlog is within the cap', async () => {
       redis.xinfo.mockResolvedValue(groupInfo('10-0'));
-      redis.xrange.mockResolvedValue(backlog(3));
+      serveStream(backlog(3));
 
       await cap(consumer({ maxBacklogOnStartup: 3 }));
 
-      expect(redis.xrange).toHaveBeenCalledWith(STREAM, '(10-0', '+');
-      expect(redis.xgroup).not.toHaveBeenCalled();
+      expect(redis.xrevrange).toHaveBeenCalledWith(
+        STREAM,
+        '+',
+        '(10-0',
+        'COUNT',
+        4,
+      );
       expect(redis.xdel).not.toHaveBeenCalled();
     });
 
-    it('fast-forwards the group past the oldest excess entries and deletes them', async () => {
+    it('deletes the oldest excess entries, keeping only the newest N', async () => {
       redis.xinfo.mockResolvedValue(groupInfo('10-0'));
-      redis.xrange.mockResolvedValue(backlog(5));
+      serveStream(backlog(5));
 
       await cap(consumer({ maxBacklogOnStartup: 2 }));
 
-      expect(redis.xgroup).toHaveBeenCalledWith('SETID', STREAM, GROUP, '13-0');
-      expect(redis.xdel).toHaveBeenCalledWith(STREAM, '11-0', '12-0', '13-0');
-      expect(redis.xgroup.mock.invocationCallOrder[0]).toBeLessThan(
+      expect(deletedIds()).toEqual(['11-0', '12-0', '13-0']);
+      // Deleting is enough — the group's cursor is never moved.
+      expect(redis.xgroup).not.toHaveBeenCalled();
+    });
+
+    it('drops everything when the cap is 0', async () => {
+      redis.xinfo.mockResolvedValue(groupInfo('10-0'));
+      serveStream(backlog(3));
+
+      await cap(consumer({ maxBacklogOnStartup: 0 }));
+
+      expect(deletedIds()).toEqual(['11-0', '12-0', '13-0']);
+    });
+
+    it('evaluates a function cap once, at check time', async () => {
+      redis.xinfo.mockResolvedValue(groupInfo('10-0'));
+      serveStream(backlog(5));
+      const budget = jest.fn().mockResolvedValue(4);
+
+      await cap(consumer({ maxBacklogOnStartup: budget }));
+
+      expect(budget).toHaveBeenCalledTimes(1);
+      expect(deletedIds()).toEqual(['11-0']);
+    });
+
+    it('drops a huge backlog in bounded pages, never all at once', async () => {
+      redis.xinfo.mockResolvedValue(groupInfo('10-0'));
+      serveStream(backlog(1_203));
+
+      await cap(consumer({ maxBacklogOnStartup: 3 }));
+
+      expect(deletedIds()).toHaveLength(1_200);
+      for (const call of redis.xdel.mock.calls as string[][]) {
+        expect(call.length - 1).toBeLessThanOrEqual(500);
+      }
+      for (const call of redis.xrange.mock.calls as unknown[][]) {
+        expect(call[3]).toBe('COUNT');
+      }
+    });
+
+    it('drops undelivered entries older than maxBacklogAgeMs, however few', async () => {
+      const now = 1_000_000;
+      jest.spyOn(Date, 'now').mockReturnValue(now);
+      try {
+        redis.xinfo.mockResolvedValue(groupInfo('10-0'));
+        serveStream([
+          ['500-0', ['jobId', 'old-1']],
+          ['939999-5', ['jobId', 'old-2']],
+          ['940000-0', ['jobId', 'fresh-1']],
+          ['999000-0', ['jobId', 'fresh-2']],
+        ]);
+
+        await cap(consumer({ maxBacklogAgeMs: 60_000 }));
+
+        expect(deletedIds()).toEqual(['500-0', '939999-5']);
+      } finally {
+        jest.restoreAllMocks();
+      }
+    });
+
+    it('applies the count cap to what the age check left', async () => {
+      const now = 1_000_000;
+      jest.spyOn(Date, 'now').mockReturnValue(now);
+      try {
+        redis.xinfo.mockResolvedValue(groupInfo('10-0'));
+        const entries: [string, string[]][] = [
+          ['500-0', ['jobId', 'old']],
+          ['950000-0', ['jobId', 'a']],
+          ['960000-0', ['jobId', 'b']],
+          ['970000-0', ['jobId', 'c']],
+        ];
+        serveStream(entries);
+        // Make deletions visible to later reads, like a real stream.
+        redis.xdel.mockImplementation((_s: string, ...ids: string[]) => {
+          for (const id of ids) {
+            entries.splice(
+              entries.findIndex(([e]) => e === id),
+              1,
+            );
+          }
+          return Promise.resolve(ids.length);
+        });
+
+        await cap(
+          consumer({ maxBacklogAgeMs: 60_000, maxBacklogOnStartup: 2 }),
+        );
+
+        expect(deletedIds()).toEqual(['500-0', '950000-0']);
+      } finally {
+        jest.restoreAllMocks();
+      }
+    });
+
+    it('never touches entries at or before the last-delivered-id (the PEL)', async () => {
+      redis.xinfo.mockResolvedValue(groupInfo('12-0'));
+      serveStream(backlog(5)); // 11-0 … 15-0
+
+      await cap(consumer({ maxBacklogOnStartup: 0 }));
+
+      expect(deletedIds()).toEqual(['13-0', '14-0', '15-0']);
+    });
+
+    it('runs onBacklogDropped on each dropped entry before deleting it, swallowing its errors', async () => {
+      redis.xinfo.mockResolvedValue(groupInfo('10-0'));
+      serveStream(backlog(3));
+      const onBacklogDropped = jest
+        .fn()
+        .mockRejectedValueOnce(new Error('db down'))
+        .mockResolvedValue(undefined);
+
+      await cap(consumer({ maxBacklogOnStartup: 1, onBacklogDropped }));
+
+      expect(onBacklogDropped).toHaveBeenCalledTimes(2);
+      expect(onBacklogDropped).toHaveBeenCalledWith({ jobId: 'x' });
+      expect(deletedIds()).toEqual(['11-0', '12-0']);
+      expect(onBacklogDropped.mock.invocationCallOrder[1]).toBeLessThan(
         redis.xdel.mock.invocationCallOrder[0],
       );
     });
@@ -113,10 +273,60 @@ describe('StreamConsumer', () => {
         ['name', 'some-other-group', 'last-delivered-id', '0-0'],
       ]);
 
-      await cap(consumer({ maxBacklogOnStartup: 2 }));
+      await cap(consumer({ maxBacklogOnStartup: 2, maxBacklogAgeMs: 1 }));
 
       expect(redis.xrange).not.toHaveBeenCalled();
-      expect(redis.xgroup).not.toHaveBeenCalled();
+      expect(redis.xrevrange).not.toHaveBeenCalled();
+      expect(redis.xdel).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('countUndelivered', () => {
+    const groupInfo = (lastDeliveredId: string) => [
+      ['name', GROUP, 'last-delivered-id', lastDeliveredId],
+    ];
+
+    it('counts entries after the last-delivered-id, up to max', async () => {
+      redis.xinfo.mockResolvedValue(groupInfo('10-0'));
+      redis.xrevrange.mockResolvedValue([['11-0', []]]);
+
+      await expect(
+        countUndelivered(redis as unknown as Redis, STREAM, GROUP, 7),
+      ).resolves.toBe(1);
+      expect(redis.xrevrange).toHaveBeenCalledWith(
+        STREAM,
+        '+',
+        '(10-0',
+        'COUNT',
+        7,
+      );
+    });
+
+    it('starts the count at newerThanMs when that is past the cursor', async () => {
+      redis.xinfo.mockResolvedValue(groupInfo('10-0'));
+      redis.xrevrange.mockResolvedValue([]);
+
+      await countUndelivered(redis as unknown as Redis, STREAM, GROUP, 7, 500);
+
+      expect(redis.xrevrange).toHaveBeenCalledWith(
+        STREAM,
+        '+',
+        '500-0',
+        'COUNT',
+        7,
+      );
+    });
+
+    it('counts 0 for a missing stream or group', async () => {
+      redis.xinfo.mockRejectedValueOnce(new Error('ERR no such key'));
+      await expect(
+        countUndelivered(redis as unknown as Redis, STREAM, GROUP, 7),
+      ).resolves.toBe(0);
+
+      redis.xinfo.mockResolvedValueOnce([]);
+      await expect(
+        countUndelivered(redis as unknown as Redis, STREAM, GROUP, 7),
+      ).resolves.toBe(0);
     });
   });
 

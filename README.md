@@ -51,9 +51,10 @@ npm run migration:run
 npm run start:dev
 ```
 
-Optional env: `JOB_STREAM_BACKLOG_CAP` (default 250, see "Reliability
-notes"), `SHORT_URL_DOMAIN` (see below), `PORT` (default 3000), `NODE_ENV`
-(`test` silences all logging).
+Optional env: `JOB_STREAM_BACKLOG_CAP` (default 250) and
+`JOB_STREAM_MAX_AGE_MINUTES` (default 60, `0` disables), both under
+"Startup backlog limits" in "Reliability notes"; `SHORT_URL_DOMAIN` (see
+below), `PORT` (default 3000), `NODE_ENV` (`test` silences all logging).
 
 ### Docker
 
@@ -169,6 +170,30 @@ The job's arrival time — the original `jobs:notify` entry id's timestamp,
 carried through as `_originalId` and then `enqueuedAt` — is the base for
 every `response_time_ms` and every end-to-end latency in the logs.
 
+### Pipeline trace logs
+
+Every step logs one `[Pipeline]` line of `key=value` pairs (via Nest's
+Logger, so `NODE_ENV=test` silences it), always with `job=<id>` and the
+`stream#id` it moved from/to — see `src/shared/logging/pipeline-trace.ts`:
+
+| Stage      | Events                                                                         |
+| ---------- | ------------------------------------------------------------------------------ |
+| `STARTUP`  | `backlog` — per stream: cursor, `expired`, `overCap`, `toProcess`              |
+| `MOVER`    | `moved` — `jobs:notify#…` → `jobs:delivering#…`, with the job's age            |
+| `MATCH`    | `received`, `matched` (recipient count + chat ids), `no-match`, `resumed`, `stale`, `skipped`, `dropped`, `handed-off` (→ `notify:telegram#…`) |
+| `DISPATCH` | `batch`, per-recipient `skipped` / `inactive` / `blocked` / `failed`, and `done` with `sent=… skipped=… inactive=… blocked=… failed=…` |
+| `PEL`      | `reclaimed` (retrying an unacked entry), `dead` (moved to dead-letter)         |
+
+Each successful send is also logged by the existing `[TELEGRAM-BOT] job=… chat=… OK` line. Handy greps:
+
+```bash
+grep "job=<id>"        # one job's whole journey
+grep "DISPATCH done"   # how many each job was sent to
+grep "STARTUP"         # what a restart dropped and what's left to send
+```
+
+Long recipient lists are truncated after 20 ids (`…(+N)`).
+
 ## Subscriber matching
 
 A direct Postgres query in `job-stream.service.ts`'s `findSubscribers`, run
@@ -266,7 +291,7 @@ can't compile.
 | `pending`   | insert time                     | `awaiting_delivery`                                                                                                                                    | job arrival → insert       |
 | `sent`      | when Telegram accepted the send | `delivered`                                                                                                                                            | job arrival → send         |
 | `failed`    | when the failure was detected   | `bot_blocked` (Telegram 403), `delivery_retries_exhausted` (`notify:telegram` entry dead-lettered), or `delivery_status_unknown` (too old to resume)   | job arrival → failure      |
-| `cancelled` | when the row was cancelled      | `user_unsubscribed` (`/stop`), `bot_blocked` (the chat's other pending rows, cancelled when a 403 deactivates it), or `recipient_inactive` (see below) | job arrival → cancellation |
+| `cancelled` | when the row was cancelled      | `user_unsubscribed` (`/stop`), `bot_blocked` (the chat's other pending rows, cancelled when a 403 deactivates it), `recipient_inactive` (see below), or `backlog_dropped` (never-sent batch dropped by the startup backlog limits) | job arrival → cancellation |
 
 - **`sent_at` was renamed to `status_changed_at`** and now changes on every
   status transition, not only on `sent`. Anyone with external SQL, views, or
@@ -323,13 +348,31 @@ can't compile.
   fields into `jobs:delivering` once the underlying problem is fixed resumes
   them through the normal retry path below (within its resume window). `jobs:notify` has no cap: its
   only work is a move, so it just retries.
-- **Startup backlog cap.** If a group's undelivered backlog on
-  `jobs:notify` or `jobs:delivering` exceeds `JOB_STREAM_BACKLOG_CAP`
-  (default 250) at startup — e.g. after a long outage — the group's cursor is
-  fast-forwarded and the oldest excess is deleted, so only the newest N are
-  processed. Stale jobs flooding subscribers all at once is judged worse than
-  losing them. This runs only once per start, before the read loop, and
-  doesn't touch entries already on a PEL.
+- **Startup backlog limits.** Once per start, before its read loop, each
+  pipeline consumer (`jobs:notify`, `jobs:delivering`, `notify:telegram`)
+  looks at its group's *undelivered* backlog (after its last-delivered-id)
+  and deletes what's too stale to send — stale jobs flooding subscribers all
+  at once is judged worse than losing them:
+  1. **By age:** every entry older than `JOB_STREAM_MAX_AGE_MINUTES`
+     (default 60 — anything older than an hour before startup; `0` disables), by its stream id's timestamp, however few
+     there are.
+  2. **By count:** of what's left, only the newest `JOB_STREAM_BACKLOG_CAP`
+     (default 250) are kept. `jobs:notify` and `jobs:delivering` share one
+     budget: the mover keeps only `cap` minus what's already waiting (and
+     not past the age limit) in `jobs:delivering`, so at most `cap` jobs go
+     on to be matched in total, whichever stage's check runs first.
+     `notify:telegram` (batches matched before the restart but never sent)
+     has its own `cap`.
+
+  Dropped `notify:telegram` batches close their recipients' still-`pending`
+  rows as `cancelled` / `backlog_dropped`. Both passes walk the stream in
+  pages of 500 (one bounded `XREVRANGE` finds the count boundary), so even a
+  backlog of millions after a very long outage is never loaded into memory
+  or sent to Redis as one huge `XDEL`. Entries are only deleted — the
+  group's cursor isn't moved, since `XREADGROUP` only delivers entries that
+  still exist — so a crash midway just leaves less for the next start.
+  Entries already on a PEL (handed to a consumer before the restart) are
+  never touched; they're resumed by the pending-entries sweep as usual.
 - **Malformed entries are dropped, not retried.** A `jobs:delivering` entry
   with no usable `jobId`/`category`/`source`, or whose `payload` isn't a JSON
   object, is logged and acked — retrying can't fix it, and throwing would

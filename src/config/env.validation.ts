@@ -40,12 +40,21 @@ class EnvironmentVariables {
   @IsString()
   REDIS_URL: string;
 
-  /** Caps how much undelivered backlog jobs:notify/jobs:delivering will
-   * accept on startup before treating the excess as too stale to process —
-   * see StreamConsumer's maxBacklogOnStartup option. */
+  /** Caps how much undelivered backlog the pipeline will accept on startup
+   * before treating the excess as too stale to process — see
+   * StreamConsumer's maxBacklogOnStartup option. */
   @IsInt()
+  @Min(0)
   @IsOptional()
   JOB_STREAM_BACKLOG_CAP: number = 250;
+
+  /** On startup, undelivered entries older than this many minutes are
+   * dropped instead of sent — see StreamConsumer's maxBacklogAgeMs
+   * option. 0 disables the age check. */
+  @IsInt()
+  @Min(0)
+  @IsOptional()
+  JOB_STREAM_MAX_AGE_MINUTES: number = 60;
 
   @IsString()
   TELEGRAM_BOT_TOKEN: string;

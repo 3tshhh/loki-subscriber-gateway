@@ -11,6 +11,8 @@ import type Redis from 'ioredis';
 import { Bot, GrammyError, InlineKeyboard } from 'grammy';
 import PQueue from 'p-queue';
 import {
+  BacklogLimits,
+  backlogLimitsFromConfig,
   CONSUMER_GROUPS,
   DELIVERED_SET_TTL_SECONDS,
   MAX_DELIVERY_ATTEMPTS,
@@ -29,6 +31,11 @@ import {
 import { NotificationReason } from '../../core/notifications/entities/notification.entity';
 import { buildJobMessage, safeButtonUrl } from './message-builder';
 import {
+  formatChatIds,
+  streamRef,
+  trace,
+} from '../../shared/logging/pipeline-trace';
+import {
   colorDeliveryDuration,
   colorModule,
   colorOutcome,
@@ -36,6 +43,17 @@ import {
 
 /** Thrown for transient failures that should leave the stream entry unacked. */
 class TransientDeliveryError extends Error {}
+
+/** Per-batch outcome counts for the DISPATCH `done` trace line. */
+type DeliveryTally = {
+  sent: number;
+  /** Already handled by an earlier attempt of the same job. */
+  skipped: number;
+  /** Not in users:active any more — cancelled, nothing sent. */
+  inactive: number;
+  /** 403: blocked the bot. */
+  blocked: number;
+};
 
 /** Total attempts (including the first) for a single 429-rate-limited send. */
 const MAX_RATE_LIMIT_ATTEMPTS = 3;
@@ -89,6 +107,7 @@ export class TelegramDispatchService implements OnModuleInit, OnModuleDestroy {
   private consumer: StreamConsumer;
   private readonly shortUrlDomain?: string;
   private readonly loggingEnabled: boolean;
+  private readonly backlogLimits: BacklogLimits;
   // Telegram's global cap is ~30 msg/sec; stay comfortably under it.
   private readonly queue = new PQueue({ intervalCap: 25, interval: 1000 });
 
@@ -101,6 +120,7 @@ export class TelegramDispatchService implements OnModuleInit, OnModuleDestroy {
   ) {
     this.shortUrlDomain = config.get<string>('SHORT_URL_DOMAIN');
     this.loggingEnabled = config.get<string>('NODE_ENV') !== 'test';
+    this.backlogLimits = backlogLimitsFromConfig(config);
   }
 
   async onModuleInit() {
@@ -114,6 +134,13 @@ export class TelegramDispatchService implements OnModuleInit, OnModuleDestroy {
         maxDeliveryAttempts: MAX_DELIVERY_ATTEMPTS,
         deadLetterStream: REDIS_STREAMS.notifyTelegramDead,
         onDeadLetter: (fields) => this.handleDeadLetter(fields),
+        // Batches matched before a restart but never sent get the same
+        // startup limits as the upstream stages — a job that sat out a long
+        // outage is just as stale here — and their recipients' rows are
+        // closed as cancelled rather than left pending forever.
+        maxBacklogOnStartup: this.backlogLimits.cap,
+        maxBacklogAgeMs: this.backlogLimits.maxAgeMs,
+        onBacklogDropped: (fields) => this.handleBacklogDropped(fields),
       },
     );
     await this.consumer.start();
@@ -184,15 +211,48 @@ export class TelegramDispatchService implements OnModuleInit, OnModuleDestroy {
       enqueuedAtMs: enqueuedAt ? Number(enqueuedAt) : Date.now(),
     };
 
+    const entryRef = streamRef(REDIS_STREAMS.notifyTelegram, entry.id);
+    trace('DISPATCH', 'batch', {
+      job: jobId,
+      entry: entryRef,
+      recipients: recipients.length,
+      chats: formatChatIds(recipients),
+      waited: `${Date.now() - job.enqueuedAtMs}ms`,
+    });
+
+    const started = Date.now();
+    const tally: DeliveryTally = {
+      sent: 0,
+      skipped: 0,
+      inactive: 0,
+      blocked: 0,
+    };
     const results = await Promise.allSettled(
       recipients.map((chatId) =>
-        this.queue.add(() => this.deliverOne(job, chatId)),
+        this.queue.add(() => this.deliverOne(job, chatId, tally)),
       ),
     );
 
+    const failed = results.filter((r) => r.status === 'rejected').length;
     const transientFailure = results.some(
       (r) =>
         r.status === 'rejected' && r.reason instanceof TransientDeliveryError,
+    );
+    trace(
+      'DISPATCH',
+      'done',
+      {
+        job: jobId,
+        entry: entryRef,
+        recipients: recipients.length,
+        ...tally,
+        failed,
+        took: `${Date.now() - started}ms`,
+        next: transientFailure
+          ? 'left unacked, will retry via XCLAIM'
+          : 'acked',
+      },
+      failed > 0 ? 'warn' : 'log',
     );
     if (transientFailure) {
       throw new TransientDeliveryError(
@@ -201,9 +261,13 @@ export class TelegramDispatchService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /** `tally`, when given, is bumped with this recipient's outcome (sent /
+   * skipped / inactive / blocked) for the batch's summary line; a thrown
+   * failure is counted by the caller instead. */
   private async deliverOne(
     job: NotifyTelegramFields,
     chatId: string,
+    tally?: DeliveryTally,
   ): Promise<void> {
     const { jobId } = job;
 
@@ -212,7 +276,8 @@ export class TelegramDispatchService implements OnModuleInit, OnModuleDestroy {
       chatId,
     );
     if (!stillActive) {
-      await this.cancelForInactiveRecipient(job, chatId);
+      const outcome = await this.cancelForInactiveRecipient(job, chatId);
+      if (tally) tally[outcome] += 1;
       return;
     }
 
@@ -224,9 +289,12 @@ export class TelegramDispatchService implements OnModuleInit, OnModuleDestroy {
     // or is permanently given up on, so skip straight to done.
     const claimed = await this.claimDelivery(jobId, chatId);
     if (!claimed) {
-      this.logger.debug(
-        `Skipping job ${jobId} for chat ${chatId}: already handled in a previous attempt`,
-      );
+      trace('DISPATCH', 'skipped', {
+        job: jobId,
+        chat: chatId,
+        reason: 'already handled in a previous attempt',
+      });
+      if (tally) tally.skipped += 1;
       return;
     }
 
@@ -254,7 +322,17 @@ export class TelegramDispatchService implements OnModuleInit, OnModuleDestroy {
       await this.sendWithRetry(chatId, text, options);
     } catch (err) {
       if (err instanceof GrammyError && err.error_code === 403) {
-        this.logger.warn(`Chat ${chatId} blocked the bot, deactivating`);
+        trace(
+          'DISPATCH',
+          'blocked',
+          {
+            job: jobId,
+            chat: chatId,
+            reason: 'chat blocked the bot (403), deactivating',
+          },
+          'warn',
+        );
+        if (tally) tally.blocked += 1;
         // No send happened, but we're never retrying this recipient either
         // — keep the claim in place so a reclaim of this entry skips them.
         // The failed row's response_time_ms is arrival→this 403, like a
@@ -273,8 +351,16 @@ export class TelegramDispatchService implements OnModuleInit, OnModuleDestroy {
         return;
       }
 
-      this.logger.error(
-        `Transient failure sending job ${jobId} to chat ${chatId}: ${(err as Error).message}`,
+      trace(
+        'DISPATCH',
+        'failed',
+        {
+          job: jobId,
+          chat: chatId,
+          reason: (err as Error).message,
+          next: 'claim released, entry will be retried',
+        },
+        'error',
       );
       // Nothing was sent — release the claim so a retry of this entry can
       // actually attempt the send again, instead of finding chatId already
@@ -288,6 +374,7 @@ export class TelegramDispatchService implements OnModuleInit, OnModuleDestroy {
     // message the recipient already got. The claim was already made before
     // sending, so there's nothing left to record here.
     const endToEndMs = Date.now() - job.enqueuedAtMs;
+    if (tally) tally.sent += 1;
     await this.reportStatus(jobId, chatId, {
       status: 'sent',
       responseTimeMs: endToEndMs,
@@ -324,19 +411,24 @@ export class TelegramDispatchService implements OnModuleInit, OnModuleDestroy {
   private async cancelForInactiveRecipient(
     job: NotifyTelegramFields,
     chatId: string,
-  ): Promise<void> {
+  ): Promise<'inactive' | 'skipped'> {
     const { jobId } = job;
     const claimed = await this.claimDelivery(jobId, chatId);
     if (!claimed) {
-      this.logger.debug(
-        `Skipping job ${jobId} for chat ${chatId}: no longer an active subscriber, already handled in a previous attempt`,
-      );
-      return;
+      trace('DISPATCH', 'skipped', {
+        job: jobId,
+        chat: chatId,
+        reason:
+          'no longer an active subscriber, already handled in a previous attempt',
+      });
+      return 'skipped';
     }
 
-    this.logger.debug(
-      `Cancelling job ${jobId} for chat ${chatId}: no longer an active subscriber`,
-    );
+    trace('DISPATCH', 'inactive', {
+      job: jobId,
+      chat: chatId,
+      reason: 'not in users:active, row cancelled (recipient_inactive)',
+    });
     try {
       await this.notifications.closeIfPending(jobId, chatId, {
         status: 'cancelled',
@@ -350,6 +442,7 @@ export class TelegramDispatchService implements OnModuleInit, OnModuleDestroy {
       await this.redis.srem(REDIS_KEYS.deliveredForJob(jobId), chatId);
       throw new TransientDeliveryError((err as Error).message);
     }
+    return 'inactive';
   }
 
   /**
@@ -471,5 +564,19 @@ export class TelegramDispatchService implements OnModuleInit, OnModuleDestroy {
         `Failed to mark delivery-retries-exhausted for job ${jobId}: ${(err as Error).message}`,
       );
     }
+  }
+
+  /** Startup backlog check is deleting this never-sent batch (too old, or
+   * past the cap) — close its recipients' still-pending rows. Errors
+   * propagate to StreamConsumer, which logs them and drops the entry
+   * anyway. */
+  private async handleBacklogDropped(
+    fields: Record<string, string>,
+  ): Promise<void> {
+    const { jobId, chatIds } = fields;
+    if (!jobId || !chatIds) return;
+    const recipients = parseStringArray(chatIds);
+    if (!recipients) return;
+    await this.notifications.markBacklogDropped(jobId, recipients);
   }
 }
