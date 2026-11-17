@@ -102,6 +102,19 @@ export class StreamConsumer {
   private stopped = false;
   private loopPromise: Promise<void> | null = null;
   private claimInterval: NodeJS.Timeout | null = null;
+  /**
+   * A dedicated connection for the blocking XREADGROUP, opened in start().
+   * Redis serves one connection's commands strictly in order, so a
+   * `BLOCK` read on the shared client holds up every other command queued
+   * behind it — every XADD/XDEL/SISMEMBER from every service in the
+   * process — for up to blockMs whenever the stream is idle. With three
+   * consumers on one client that made each job's two hand-off writes wait
+   * ~5s apiece (≈10s per job) and throttled sends far below the queue's
+   * rate, which is how the pipeline fell behind and backlog piled up. Only
+   * the blocking read uses this connection; everything else stays on the
+   * shared one.
+   */
+  private reader: Redis | null = null;
 
   constructor(
     private readonly redis: Redis,
@@ -183,6 +196,9 @@ export class StreamConsumer {
       ),
     );
 
+    // Same URL and options as the shared client (maxRetriesPerRequest:
+    // null included, so the read loop rides out Redis restarts the same way).
+    this.reader = this.redis.duplicate();
     this.loopPromise = this.readLoop();
     const claimIntervalMs = this.options.claimIntervalMs ?? 30_000;
     this.claimInterval = setInterval(() => {
@@ -199,6 +215,13 @@ export class StreamConsumer {
     this.stopped = true;
     if (this.claimInterval) clearInterval(this.claimInterval);
     if (this.loopPromise) await this.loopPromise;
+    if (this.reader) {
+      const reader = this.reader;
+      this.reader = null;
+      // quit() lets anything in flight finish; disconnect() is the fallback
+      // if the connection is already broken.
+      await reader.quit().catch(() => reader.disconnect());
+    }
   }
 
   private async ensureGroup(): Promise<void> {
@@ -399,7 +422,7 @@ export class StreamConsumer {
     while (!this.stopped) {
       let results: [string, [string, string[]][]][] | null = null;
       try {
-        results = (await this.redis.xreadgroup(
+        results = (await (this.reader ?? this.redis).xreadgroup(
           'GROUP',
           this.group,
           this.consumerName,

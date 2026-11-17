@@ -281,6 +281,61 @@ describe('StreamConsumer', () => {
     });
   });
 
+  describe('read connection', () => {
+    it('runs the blocking XREADGROUP on its own connection, everything else on the shared one, and closes it on stop', async () => {
+      let reads = 0;
+      const reader = {
+        // First read hands back one entry, later reads come back empty —
+        // each on a macrotask, like a real BLOCK timing out.
+        xreadgroup: jest.fn(
+          () =>
+            new Promise((resolve) =>
+              setImmediate(() =>
+                resolve(
+                  reads++ === 0
+                    ? [[STREAM, [['5-0', ['jobId', 'job-5']]]]]
+                    : null,
+                ),
+              ),
+            ),
+        ),
+        quit: jest.fn().mockResolvedValue('OK'),
+        disconnect: jest.fn(),
+      };
+      const shared = {
+        ...redis,
+        xinfo: jest.fn().mockResolvedValue([]),
+        xreadgroup: jest.fn(),
+        duplicate: jest.fn(() => reader),
+      };
+      const c = new StreamConsumer(
+        shared as unknown as Redis,
+        STREAM,
+        GROUP,
+        'worker-1',
+        handle,
+        { claimIntervalMs: 60_000 },
+      );
+
+      await c.start();
+      while (handle.mock.calls.length === 0) {
+        await new Promise((r) => setImmediate(r));
+      }
+      await c.stop();
+
+      expect(shared.duplicate).toHaveBeenCalledTimes(1);
+      expect(reader.xreadgroup).toHaveBeenCalled();
+      expect(shared.xreadgroup).not.toHaveBeenCalled();
+      expect(handle).toHaveBeenCalledWith({
+        id: '5-0',
+        fields: { jobId: 'job-5' },
+      });
+      // The ack goes out on the shared client, not behind a BLOCK.
+      expect(shared.xack).toHaveBeenCalledWith(STREAM, GROUP, '5-0');
+      expect(reader.quit).toHaveBeenCalledTimes(1);
+    });
+  });
+
   describe('countUndelivered', () => {
     const groupInfo = (lastDeliveredId: string) => [
       ['name', GROUP, 'last-delivered-id', lastDeliveredId],
